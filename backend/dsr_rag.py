@@ -208,11 +208,18 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     filenames = state.get("filenames", [])
     
     docs_contents = []
+    sources_data = []
+    seen_filenames = set()
+
     for i, file_id in enumerate(file_ids):
          content = await load_from_gridfs(file_id)
          name = filenames[i] if i < len(filenames) else f"Unknown Source {i}"
          docs_contents.append(f"SOURCE: {name}\nCONTENT: {content}")
          
+         if name not in seen_filenames:
+             sources_data.append({"filename": name, "content": content})
+             seen_filenames.add(name)
+             
     context_str = "\n\n=== SOURCE CONTEXT ===\n\n".join(docs_contents)
     messages = state.get("messages", [])
     
@@ -221,9 +228,14 @@ You are also a data visualization expert. You MUST generate charts (pie, bar, xy
 
 ### 📚 GROUNDING RULES:
 1. Use the provided context to answer. 
-2. **CITE YOUR SOURCES**: Use square brackets with the filename, e.g., [filename.pdf], to attribute information.
-3. If multiple sources support a point, cite both: [file1.pdf][file2.pdf].
+2. **CONSOLIDATED ATTRIBUTION**:
+    - **NEVER** cite every single line in a list if they come from the same source.
+    - **CITE ONCE** per paragraph or distinct section.
+    - **PROHIBITED STYLE**: "Fact 1 [file.pdf]\nFact 2 [file.pdf]" -> **INCORRECT**.
+    - **REQUIRED STYLE**: "Here is the list [file.pdf]:\n- Fact 1\n- Fact 2" OR "Fact 1 and Fact 2. [file.pdf]" -> **CORRECT**.
+3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].
 4. Only cite sources provided in the "SOURCE CONTEXT" section below.
+5. If no relevant sources exist, do not cite and inform the user you don't have that information.
 
 ### � DATA VISUALIZATION RULES:
 1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
@@ -254,9 +266,9 @@ Answer with excellence. If the context is insufficient, use tools or inform the 
     queue = config.get("configurable", {}).get("queue")
     
     if queue:
-        # Emit final sources list before streaming tokens
+        # Emit final sources list (enriched with content) before streaming tokens
         try:
-            queue.put_nowait({"type": "sources", "sources": filenames})
+            queue.put_nowait({"type": "sources", "sources": sources_data})
         except:
             pass
 

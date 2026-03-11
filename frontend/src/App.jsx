@@ -8,7 +8,7 @@ function App() {
   );
 
   return (
-    <div className="min-h-screen bg-transparent w-full text-slate-800 flex flex-col py-8 px-6 sm:px-10">
+    <div className="min-h-screen lg:h-screen bg-transparent w-full text-slate-800 flex flex-col py-8 px-6 sm:px-10 lg:overflow-hidden">
       <header className="mb-10 w-full mx-auto flex flex-col sm:flex-row justify-between items-start sm:items-center border-b border-slate-200 pb-6">
         <div>
           <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-900 tracking-tight mb-2">
@@ -29,9 +29,9 @@ function App() {
         </button>
       </header>
 
-      <main className="w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 flex-grow">
-        <div className="lg:col-span-4 space-y-6 flex flex-col">
-          <div className="bg-white rounded-2xl p-6 shadow-md border border-slate-200 flex-grow">
+      <main className="w-full mx-auto grid grid-cols-1 lg:grid-cols-12 gap-8 flex-grow lg:flex-1 lg:min-h-0 lg:overflow-hidden">
+        <div className="lg:col-span-4 flex flex-col gap-6 lg:min-h-0">
+          <div className="bg-white rounded-2xl p-6 shadow-md border border-slate-200 flex-grow lg:flex-1 lg:min-h-0 flex flex-col">
             <div className="flex items-center gap-3 mb-6">
               <div className="bg-slate-100 p-2 rounded-lg border border-slate-200">
                 <svg className="w-5 h-5 text-slate-700" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -43,7 +43,7 @@ function App() {
             <FileUpload />
           </div>
 
-          <div className="bg-slate-50 rounded-2xl p-5 border border-slate-200 shadow-sm">
+          <div className="bg-slate-50 rounded-2xl p-5 border border-slate-200 shadow-sm shrink-0">
             <h2 className="text-sm font-semibold text-slate-500 tracking-wider uppercase mb-3">Session Info</h2>
             <div className="flex items-center gap-3 text-xs font-mono bg-white p-3 rounded-lg text-slate-600 break-all border border-slate-200 shadow-[inset_0_1px_4px_rgba(0,0,0,0.02)]">
               <span className="text-slate-700 font-bold bg-slate-100 px-2 py-1 rounded">ID</span>
@@ -55,8 +55,8 @@ function App() {
           </div>
         </div>
 
-        <div className="lg:col-span-8 flex flex-col">
-          <div className="bg-white rounded-2xl shadow-md border border-slate-200 h-[75vh] min-h-[600px] flex flex-col overflow-hidden">
+        <div className="lg:col-span-8 flex flex-col min-h-[500px] lg:min-h-0">
+          <div className="bg-white rounded-2xl shadow-md border border-slate-200 flex-grow lg:flex-1 lg:min-h-0 flex flex-col lg:overflow-hidden">
             <div className="p-5 border-b border-slate-100 bg-slate-50/50 flex items-center gap-3">
               <div className="bg-slate-100 p-2 rounded-lg border border-slate-200">
                 <svg className="w-5 h-5 text-slate-700" fill="none" viewBox="0 0 24 24" stroke="currentColor">

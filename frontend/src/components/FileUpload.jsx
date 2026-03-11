@@ -89,7 +89,7 @@ const FileUpload = () => {
     };
 
     return (
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-4 lg:h-full lg:min-h-0">
             <div className="flex items-center justify-center w-full">
                 <label htmlFor="dropzone-file" className="flex flex-col items-center justify-center w-full h-36 border-2 border-slate-300 border-dashed rounded-2xl cursor-pointer bg-slate-50/50 hover:bg-slate-100 transition-all group overflow-hidden relative">
                     <div className="flex flex-col items-center justify-center pt-5 pb-6">
@@ -137,7 +137,7 @@ const FileUpload = () => {
             )}
 
             {/* Uploaded Documents List */}
-            <div className="mt-4 border-t border-slate-200 pt-6 flex-grow flex flex-col">
+            <div className="mt-4 border-t border-slate-200 pt-6 flex-grow lg:flex-1 flex flex-col lg:min-h-0">
                 <div className="flex items-center gap-2 mb-4 text-slate-700">
                     <svg className="w-4 h-4 text-slate-500" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
