@@ -22,6 +22,8 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 import numexpr
+import pandas as pd
+import io
 
 # ==========================================
 # State Management (TypedDict)
@@ -29,11 +31,13 @@ import numexpr
 class GraphState(TypedDict):
     """
     Represents the state of the "Dual-State Reflexive RAG" (DSR-RAG) graph.
-    Golden Rule: Long documents NEVER enter here. Only pointers (file_ids).
+    Golden Rule: Long source files NEVER enter here. 
+    Retrieved chunks (metadata + text) are allowed for efficient processing.
     """
     messages: Annotated[List[BaseMessage], operator.add]
     file_ids: List[str] 
     filenames: List[str]
+    documents: List[Dict[str, Any]] # NEW: List of retrieved chunks with text
     query: str
     generation: Optional[str]
     rewrite_count: int
@@ -60,10 +64,12 @@ fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(db)
 # ==========================================
 # Artifact Offloading to GridFS
 # ==========================================
-async def save_to_gridfs(content: str, filename: str, metadata: Dict = None) -> str:
+async def save_to_gridfs(content: Any, filename: str, metadata: Dict = None) -> str:
+    if isinstance(content, str):
+        content = content.encode('utf-8')
     file_id = await fs.upload_from_stream(
         filename,
-        content.encode('utf-8'),
+        content,
         metadata=metadata or {}
     )
     return str(file_id)
@@ -72,6 +78,10 @@ async def load_from_gridfs(file_id: str) -> str:
     grid_out = await fs.open_download_stream(ObjectId(file_id))
     content = await grid_out.read()
     return content.decode('utf-8')
+
+async def load_binary_from_gridfs(file_id: ObjectId) -> bytes:
+    grid_out = await fs.open_download_stream(file_id)
+    return await grid_out.read()
 
 # ==========================================
 # Native Vector Search and Lookup (Aggregation Pipeline)
@@ -103,6 +113,7 @@ async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> L
                 "_id": 0,
                 "score": {"$meta": "vectorSearchScore"},
                 "gridfs_file_id": 1,
+                "text": 1,                # PROJECT TEXT
                 "filename": "$file_metadata.filename",
                 "metadata": "$file_metadata.metadata"
             }
@@ -114,7 +125,7 @@ async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> L
 # ==========================================
 # Global LLM and Embeddings Initialization
 # ==========================================
-llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 # ==========================================
@@ -126,9 +137,19 @@ async def retrieve_documents(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
     query_embedding = await embeddings.aembed_query(query)
     docs = await retrieve_from_mongo(query_embedding, limit=10)
-    retrieved_file_ids = [str(doc["gridfs_file_id"]) for doc in docs]
+    
+    # Stringify ObjectId for msgpack serialization compatibility
+    for doc in docs:
+        if "gridfs_file_id" in doc:
+            doc["gridfs_file_id"] = str(doc["gridfs_file_id"])
+            
+    retrieved_file_ids = [doc["gridfs_file_id"] for doc in docs]
     filenames = [doc["filename"] for doc in docs]
-    return {"file_ids": retrieved_file_ids, "filenames": filenames}
+    return {
+        "file_ids": retrieved_file_ids, 
+        "filenames": filenames,
+        "documents": docs
+    }
 
 class Grade(BaseModel):
     binary_score: str = Field(description="Is the document relevant to the question? Answer 'yes' or 'no'")
@@ -209,25 +230,35 @@ async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     grader_chain = prompt | structured_llm_grader
     relevant_ids = []
     relevant_filenames = []
+    relevant_docs = []
     
-    for i, file_id in enumerate(file_ids):
-        doc_content = await load_from_gridfs(file_id)
+    # Use documents from state (contains text) instead of loading from GridFS
+    documents = state.get("documents", [])
+    
+    for doc in documents:
+        doc_content = doc.get("text", "")
+        file_id = str(doc.get("gridfs_file_id", ""))
+        filename = doc.get("filename", "Unknown")
+        
         try:
             score: Grade = await grader_chain.ainvoke({"question": query, "document": doc_content, "system": system})
             
             if score and score.binary_score.lower() == "yes":
-                emit_log(config, f"  [+] Document ({file_id}) RELEVANT")
+                emit_log(config, f"  [+] Document ({filename}) RELEVANT")
                 relevant_ids.append(file_id)
-                if i < len(filenames):
-                    relevant_filenames.append(filenames[i])
+                relevant_filenames.append(filename)
+                relevant_docs.append(doc)
             else:
-                emit_log(config, f"  [-] Document ({file_id}) IRRELEVANT (score: {score})")
+                emit_log(config, f"  [-] Document ({filename}) IRRELEVANT (score: {score})")
         except Exception as e:
-            emit_log(config, f"  [!] Error grading document {file_id}: {str(e)}")
-            # Default to irrelevant on error to be safe
+            emit_log(config, f"  [!] Error grading document {filename}: {str(e)}")
             continue
             
-    return {"file_ids": relevant_ids, "filenames": relevant_filenames}
+    return {
+        "file_ids": relevant_ids, 
+        "filenames": relevant_filenames,
+        "documents": relevant_docs
+    }
 
 def check_relevance(state: GraphState, config: RunnableConfig) -> str:
     """Conditional Edge: Routing based on the existence of relevant pointers."""
@@ -269,10 +300,13 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     docs_contents = []
     sources_data = []
     seen_filenames = set()
+    
+    # Use documents from state (contains text) instead of loading from GridFS
+    retrieved_docs = state.get("documents", [])
 
-    for i, file_id in enumerate(file_ids):
-         content = await load_from_gridfs(file_id)
-         name = filenames[i] if i < len(filenames) else f"Unknown Source {i}"
+    for doc in retrieved_docs:
+         content = doc.get("text", "")
+         name = doc.get("filename", "Unknown Source")
          docs_contents.append(f"SOURCE: {name}\nCONTENT: {content}")
          
          if name not in seen_filenames:
@@ -298,7 +332,8 @@ You are also a data visualization expert. You MUST generate charts (pie, bar, xy
 
 ### � DATA VISUALIZATION RULES:
 1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
-2. **SIMPLE CHARTS** (Last resort):
+2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.
+3. **SIMPLE CHARTS** (Last resort):
    - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.
      ```mermaid
      pie title "Title"
@@ -397,7 +432,92 @@ async def query_database_stats() -> str:
     except Exception as e:
         return f"Error accessing database: {e}"
 
-tools = [calculator, summarize_document, query_database_stats]
+@tool
+async def query_structured_data(query: str, filename: str) -> str:
+    """Useful for quantitative analysis on CSV/XLSX files (counting, aggregate, filter). 
+    Pass the natural language query and the filename (e.g., 'How many companies from Europe?', 'data.csv')."""
+    try:
+        # 1. Find the structured file in GridFS
+        cursor = db["fs.files"].find({"filename": filename, "metadata.type": "structured"})
+        files = await cursor.to_list(length=1)
+        if not files:
+             # Fallback: try finding ANY file with that name if 'structured' isn't set (for older uploads)
+             cursor = db["fs.files"].find({"filename": filename})
+             files = await cursor.to_list(length=1)
+             if not files:
+                 return f"File '{filename}' not found or not indexed as structured data."
+        
+        file_id = files[0]["_id"]
+        content = await load_binary_from_gridfs(file_id)
+        
+        # 2. Load into Pandas
+        try:
+            if filename.endswith('.csv'):
+                # Try to sniff delimiter and handle BOM
+                stream = io.BytesIO(content)
+                # Decode to string context for sniffing if needed, or just use pandas defaults
+                df = pd.read_csv(stream, sep=None, engine='python', on_bad_lines='skip')
+            else:
+                df = pd.read_excel(io.BytesIO(content))
+        except Exception as parse_err:
+             # Fallback to UTF-8-sig (BOM handling) if direct binary read fails
+             if filename.endswith('.csv'):
+                 df = pd.read_csv(io.StringIO(content.decode('utf-8-sig', errors='ignore')), sep=None, engine='python')
+             else:
+                 raise parse_err
+        
+        # CLEANUP: Strip whitespace and LOWERCASE column names to avoid KeyErrors
+        df.columns = [c.strip().lower() for c in df.columns]
+            
+        # 3. Use LLM to generate analysis code
+        columns = list(df.columns)
+        sample = df.head(5).to_string()
+        
+        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.
+Sample data:
+{sample}
+
+TASK: Write a SHORT Python snippet to answer this question: "{query}"
+The snippet MUST:
+1. Use the variable 'df'.
+2. Use LOWERCASE column names from the provided list.
+3. Calculate the answer.
+4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.
+5. Do NOT use print(). 
+6. Be concise.
+
+Code:"""
+        
+        response = await llm.ainvoke(analyze_prompt)
+        code = response.content.replace('```python', '').replace('```', '').strip()
+        
+        # 4. Execute (sandbox-lite)
+        local_vars = {"df": df, "pd": pd}
+        try:
+            exec(code, {}, local_vars)
+            raw_result = local_vars.get("result", "No result returned from code execution.")
+            
+            # FORMATTING: If result is a DataFrame or Series, convert to Markdown table
+            try:
+                if isinstance(raw_result, pd.DataFrame):
+                    result = raw_result.to_markdown()
+                elif isinstance(raw_result, pd.Series):
+                    result = raw_result.to_frame().to_markdown()
+                else:
+                    result = str(raw_result)
+            except ImportError:
+                # Fallback if 'tabulate' is not installed yet
+                result = str(raw_result)
+                
+        except Exception as exec_err:
+            result = f"Code execution error: {exec_err}\n\nGenerated Code:\n{code}\nAvailable Columns: {columns}"
+        
+        return f"Analysis Result for '{query}' on {filename}:\n\n{result}"
+        
+    except Exception as e:
+        return f"Error analyzing structured data: {str(e)}"
+
+tools = [calculator, summarize_document, query_database_stats, query_structured_data]
 llm_with_tools = llm.bind_tools(tools)
 tool_node = ToolNode(tools)
 

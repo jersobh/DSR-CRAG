@@ -57,6 +57,17 @@ async def upload_file(file: UploadFile = File(...)):
     content = await file.read()
     full_text = ""
     
+    # 1. Store the FULL ORIGINAL file in GridFS first (for all types)
+    # This allows tools like summarize_document or query_structured_data to access the source
+    metadata = {"filename": file.filename, "source": "user_upload"}
+    if filename.endswith(('.csv', '.xlsx', '.xls')):
+        metadata["type"] = "structured"
+    else:
+        metadata["type"] = "document"
+    
+    gridfs_file_id_str = await save_to_gridfs(content, file.filename, metadata)
+    gridfs_file_id = ObjectId(gridfs_file_id_str)
+    
     try:
         if filename.endswith('.pdf'):
             # Extract text from PDF
@@ -79,26 +90,37 @@ async def upload_file(file: UploadFile = File(...)):
             raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or XLSX.")
             
     except Exception as e:
+        # Cleanup GridFS if parsing fails (optional but good practice)
+        # await fs.delete(gridfs_file_id)
         raise HTTPException(status_code=500, detail=f"Failed to parse file: {str(e)}")
         
     if not full_text.strip():
         raise HTTPException(status_code=400, detail="File has no extractable text")
         
     chunks = text_splitter.split_text(full_text)
-    metadata = {"filename": file.filename, "source": "user_upload"}
     
-    # Process chunks into MongoDB Atlas
-    for i, chunk in enumerate(chunks):
-        embedding = await embeddings.aembed_query(chunk)
-        gridfs_file_id_str = await save_to_gridfs(chunk, file.filename, metadata)
-        
-        vector_doc = {
-            "embedding": embedding,
-            "gridfs_file_id": ObjectId(gridfs_file_id_str),
+    # 2. BATCH EMBEDDING for performance
+    # Instead of N individual API calls, we make one batch call.
+    try:
+        chunk_embeddings = await embeddings.aembed_documents(chunks)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Embedding failed: {str(e)}")
+
+    # 3. Store chunks directly in MongoDB (NOT GridFS)
+    # Each document in 'vectors' now contains the text content for faster RAG retrieval.
+    vector_docs = []
+    for i, (chunk, emb) in enumerate(zip(chunks, chunk_embeddings)):
+        vector_docs.append({
+            "embedding": emb,
+            "text": chunk, # STORE DIRECTLY
+            "gridfs_file_id": gridfs_file_id, 
             "chunk_index": i,
-            "filename": file.filename
-        }
-        await vector_collection.insert_one(vector_doc)
+            "filename": file.filename,
+            "metadata": {"source": file.filename}
+        })
+    
+    if vector_docs:
+        await vector_collection.insert_many(vector_docs)
         
     return {"message": f"Document '{file.filename}' processed successfully", "chunks": len(chunks)}
 
@@ -234,33 +256,37 @@ async def list_documents():
 
 @app.delete("/documents/{filename}")
 async def delete_document(filename: str):
-    """Deletes a document and all its vector chunks"""
+    """Deletes a document, all its chunks, and the full structured binary if it exists."""
     try:
-        # 1. Find all GridFS IDs associated with this filename in the vector db
-        cursor = vector_collection.find({"filename": filename}, {"gridfs_file_id": 1, "_id": 0})
-        gridfs_ids = {doc["gridfs_file_id"] for doc in await cursor.to_list(length=None)}
+        from dsr_rag import fs, db
         
-        from dsr_rag import fs
+        # 1. Find ALL GridFS IDs associated with this filename (chunks AND original structured file)
+        # We search fs.files directly for comprehensive cleanup
+        cursor = db["fs.files"].find({"filename": filename}, {"_id": 1})
+        gridfs_ids = [doc["_id"] for doc in await cursor.to_list(length=None)]
         
-        # 2. Delete from GridFS
-        deleted_gridfs = 0
-        for f_id in gridfs_ids:
+        # 2. Delete from GridFS in parallel
+        async def safe_delete(f_id):
             try:
-                 await fs.delete(f_id)
-                 deleted_gridfs += 1
-            except Exception as grid_err:
-                 print(f"Error deleting from GridFS {f_id}: {grid_err}")
-                 # Proceeding as it might have been deleted already
-                 
+                await fs.delete(f_id)
+                return True
+            except Exception:
+                # Silently ignore if already deleted or missing
+                return False
+        
+        results = await asyncio.gather(*(safe_delete(f_id) for f_id in gridfs_ids))
+        deleted_gridfs = sum(1 for r in results if r)
+        
         # 3. Delete from Vector Store
-        result = await vector_collection.delete_many({"filename": filename})
+        vector_result = await vector_collection.delete_many({"filename": filename})
         
         return {
             "message": f"Document '{filename}' deleted", 
-            "chunks_removed": result.deleted_count,
+            "chunks_removed": vector_result.deleted_count,
             "gridfs_files_removed": deleted_gridfs
         }
     except Exception as e:
+        print(f"[!] Error deleting document {filename}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
