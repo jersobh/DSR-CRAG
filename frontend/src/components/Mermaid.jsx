@@ -1,9 +1,9 @@
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import mermaid from 'mermaid';
 
-// Initialize mermaid configuration with a clean style
+// Initialize mermaid configuration
 mermaid.initialize({
-    startOnLoad: true,
+    startOnLoad: false,
     theme: 'base',
     themeVariables: {
         primaryColor: '#f1f5f9',
@@ -18,8 +18,9 @@ mermaid.initialize({
 
 export const Mermaid = ({ chart }) => {
     const ref = useRef(null);
+    const [renderId] = useState(() => `mermaid-${Math.random().toString(36).substring(2, 9)}`);
 
-    // Ultra-aggressive sanitizer for Mermaid v11.13.0
+    // Advanced sanitizer for Mermaid v11.13.0
     const sanitizeChart = (text) => {
         if (!text) return "";
         let lines = text.trim().split('\n');
@@ -32,18 +33,17 @@ export const Mermaid = ({ chart }) => {
             let cleanLine = line.trim();
             if (!cleanLine) continue;
 
-            // Remove hallucinatory blocks like { type categ } anywhere in the line
+            // Remove hallucinatory blocks like { type categ }
             cleanLine = cleanLine.replace(/\{[^{}]*(type|categ|direction|theme)[^{}]*\}/gi, "");
 
             // Pie chart specific sanitization
             if (cleanLines.length > 0 && cleanLines[0].toLowerCase().startsWith('pie')) {
                 if (cleanLine.includes(':')) {
                     const parts = cleanLine.split(':');
-                    const label = parts[0].trim();
-                    // Keep only numeric values
+                    const label = parts[0].trim().replace(/[^a-zA-Z0-9\s]/g, ''); // Clean labels
                     const valueMatch = parts[1].trim().match(/^(\d+(\.\d+)?)/);
                     if (valueMatch) {
-                        cleanLine = `${label} : ${valueMatch[1]}`;
+                        cleanLine = `"${label}" : ${valueMatch[1]}`;
                     }
                 }
             }
@@ -55,56 +55,53 @@ export const Mermaid = ({ chart }) => {
                 cleanLine = `title "${sanitizedTitle}"`;
             }
 
-            // Remove any trailing semicolons or illegal characters
+            // Remove illegal characters from node labels in flowcharts
+            if (cleanLine.includes('[') && cleanLine.includes(']')) {
+                cleanLine = cleanLine.replace(/\[([^\]]*)\]/g, (match, content) => {
+                    return `["${content.replace(/"/g, '')}"]`;
+                });
+            }
+
+            // Remove any trailing semicolons or illegal punctuation
             cleanLine = cleanLine.replace(/[;]$/, '').trim();
 
             if (cleanLine) cleanLines.push(cleanLine);
         }
 
-        const result = cleanLines.join('\n');
-        console.log("DEBUG: Sanitized Mermaid Chart:\n", result);
-        return result;
+        return cleanLines.join('\n');
     };
 
     useEffect(() => {
-        console.log("DEBUG: Raw Mermaid Chart Input:\n", chart);
-        const cleanChart = sanitizeChart(chart);
-        if (ref.current && cleanChart) {
-            const id = `mermaid-${Math.random().toString(36).substring(7)}`;
-
-            // Clear previous content
-            ref.current.innerHTML = '<div class="text-xs text-slate-400 animate-pulse">Rendering chart...</div>';
+        const renderChart = async () => {
+            if (!ref.current || !chart) return;
+            
+            const cleanChart = sanitizeChart(chart);
 
             try {
-                mermaid.render(id, cleanChart).then((result) => {
+                // Check if the chart is valid before attempting to render (prevents some v11 crashes)
+                if (await mermaid.parse(cleanChart)) {
+                    const { svg } = await mermaid.render(renderId, cleanChart);
                     if (ref.current) {
-                        ref.current.innerHTML = result.svg;
+                        ref.current.innerHTML = svg;
+                        ref.current.style.display = 'block';
                     }
-                }).catch(err => {
-                    console.error("Mermaid Rendering Error:", err);
-                    if (ref.current) {
-                        ref.current.innerHTML = `
-                            <div class="mt-4 p-4 bg-red-50 border border-red-200 rounded-xl font-mono">
-                                <div class="flex items-center gap-2 text-red-600 font-bold text-sm mb-2">
-                                    <svg class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                                    </svg>
-                                    Mermaid Syntax Error (v11)
-                                </div>
-                                <div class="text-[11px] text-red-500 mb-3 bg-white/50 p-2 rounded border border-red-100 italic">
-                                    ${err.message || 'The syntax generated by the AI is invalid for this chart type.'}
-                                </div>
-                                <div class="text-[10px] text-slate-400 font-bold uppercase tracking-wider mb-1">Generated Code:</div>
-                                <pre class="text-[10px] bg-slate-900 text-slate-300 p-3 rounded-lg overflow-x-auto shadow-inner leading-relaxed">${cleanChart}</pre>
-                            </div>`;
-                    }
-                });
-            } catch (e) {
-                console.error("Critical Mermaid Error:", e);
-                ref.current.innerHTML = `<div class="text-red-500 text-xs">Critical render error: ${e.message}</div>`;
+                }
+            } catch (err) {
+                console.error("Mermaid Render Failed:", err);
+                if (ref.current) {
+                    ref.current.style.display = 'none'; // Gracefully hide on error
+                }
             }
-        }
-    }, [chart]);
+        };
 
-    return <div ref={ref} className="mermaid-chart flex justify-center my-6 overflow-x-auto bg-white p-4 rounded-lg border border-gray-200 shadow-sm" />;
+        renderChart();
+    }, [chart, renderId]);
+
+    return (
+        <div 
+            ref={ref} 
+            className="mermaid-chart flex justify-center my-6 overflow-x-auto bg-slate-50 border border-slate-200 p-6 rounded-2xl transition-all" 
+            style={{ display: 'none' }} // Hidden by default until success
+        />
+    );
 };

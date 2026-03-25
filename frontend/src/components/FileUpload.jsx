@@ -66,8 +66,10 @@ const FileUpload = () => {
             setMessage(`Uploaded ${successCount}/${files.length} documents.`);
         }
 
-        // Refresh document list
-        fetchDocuments();
+        // Refresh document list with a small delay for consistency
+        setTimeout(() => {
+            fetchDocuments();
+        }, 500);
     };
 
     const handleDelete = async (filename) => {
@@ -99,15 +101,17 @@ const FileUpload = () => {
                         <p className="mb-2 text-sm text-slate-600">
                             <span className="font-semibold text-slate-800">Click to select files</span> or drag and drop
                         </p>
-                        <p className="text-xs text-slate-500">PDF documents only</p>
+                        <p className="text-xs text-slate-500 font-bold uppercase tracking-wider bg-slate-200/50 px-3 py-1 rounded-full mt-2">
+                          PDF • CSV • XLSX
+                        </p>
 
                         {files.length > 0 && (
-                            <div className="absolute bottom-0 left-0 right-0 bg-slate-800 text-white text-xs font-medium py-1.5 text-center">
-                                {files.length} file(s) ready to upload
+                            <div className="absolute bottom-0 left-0 right-0 bg-slate-800 text-white text-[10px] font-black uppercase tracking-widest py-2 text-center">
+                                {files.length} file(s) ready to ingest
                             </div>
                         )}
                     </div>
-                    <input id="dropzone-file" type="file" className="hidden" accept=".pdf" multiple onChange={handleFileChange} />
+                    <input id="dropzone-file" type="file" className="hidden" accept=".pdf,.csv,.xlsx,.xls" multiple onChange={handleFileChange} />
                 </label>
             </div>
 

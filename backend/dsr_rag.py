@@ -18,7 +18,7 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel, Field
 
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
+
 from langgraph.prebuilt import ToolNode
 from langchain_core.tools import tool
 import numexpr
@@ -114,7 +114,7 @@ async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> L
 # ==========================================
 # Global LLM and Embeddings Initialization
 # ==========================================
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite-preview", temperature=0)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001")
 
 # ==========================================
@@ -132,6 +132,65 @@ async def retrieve_documents(state: GraphState, config: RunnableConfig) -> Dict:
 
 class Grade(BaseModel):
     binary_score: str = Field(description="Is the document relevant to the question? Answer 'yes' or 'no'")
+
+class RouteQuery(BaseModel):
+    datasource: str = Field(
+        description="The datasource to use for the query. Answer 'vectorstore' if the query needs context from documents, or 'generate' for general conversation or simple tasks.",
+        enum=["vectorstore", "generate"]
+    )
+
+async def route_query(state: GraphState, config: RunnableConfig) -> str:
+    """
+    Routely node: Checks if document retrieval is actually needed.
+    """
+    emit_log(config, "--- NODE: ROUTE QUERY (DECISION) ---")
+    query = state["query"]
+    messages = state.get("messages", [])
+    
+    # Format a brief history snippet for the router to understand context (e.g., who the user is)
+    history_snippet = "\n".join([f"{m.type}: {m.content}" for m in messages[-5:]])
+    
+    system = """You are an expert at routing user queries for a stateful RAG application.
+    Your task is to determine if the user's query requires retrieving information from an external document store (vectorstore) or if it can be answered directly using the conversation history and general knowledge (generate).
+
+    CONTEXT (Last 5 messages):
+    {history}
+
+    DIRECTIONS:
+    - Choose 'generate' for greetings, personal introductions, follow-up questions that can be answered using the provided CONTEXT, or general conversational chit-chat.
+    - Choose 'vectorstore' if the query requires specific factual information, professional knowledge, or details that are not present in the current CONTEXT and likely reside in the document collection.
+
+    Answer ONLY with 'vectorstore' or 'generate'."""
+    
+    prompt = PromptTemplate(
+        template="{system}\n\nUSER QUERY: {question}\n\nDecision:",
+        input_variables=["system", "history", "question"],
+    )
+    
+    # We use the raw LLM for better compatibility with lite models
+    router_chain = prompt | llm
+    
+    try:
+        response = await router_chain.ainvoke({
+            "question": query, 
+            "system": system.format(history=history_snippet),
+            "history": history_snippet
+        })
+        
+        # Manually parse the text response
+        content = response.content.lower().strip()
+        if "vectorstore" in content:
+            emit_log(config, "  -> Datasource decision: vectorstore")
+            return "vectorstore"
+        elif "generate" in content:
+            emit_log(config, "  -> Datasource decision: generate")
+            return "generate"
+        else:
+            emit_log(config, f"  [!] Router returned ambiguous response: '{content}'. Defaulting to vectorstore.")
+            return "vectorstore"
+    except Exception as e:
+        emit_log(config, f"  [!] Routing error: {str(e)}. Defaulting to vectorstore.")
+        return "vectorstore"
 
 async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Reflexive grader. Checks if IDs point to useful contexts."""
@@ -361,7 +420,16 @@ def build_dsr_rag_graph():
     workflow.add_node("generate_answer", generate_answer)
     workflow.add_node("tools", tool_node)
 
-    workflow.add_edge(START, "retrieve_documents")
+    # Initial routing
+    workflow.add_conditional_edges(
+        START,
+        route_query,
+        {
+            "vectorstore": "retrieve_documents",
+            "generate": "generate_answer"
+        }
+    )
+
     workflow.add_edge("retrieve_documents", "grade_documents")
 
     workflow.add_conditional_edges(

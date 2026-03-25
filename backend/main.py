@@ -2,6 +2,9 @@ import os
 import io
 import asyncio
 import json
+import lmdb
+from langgraph_checkpoint_lmdb import AsyncLMDBSaver
+
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +12,11 @@ from pydantic import BaseModel
 import pymupdf
 from bson import ObjectId
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
+
+
+env = lmdb.open("./checkpoints", max_dbs=10)
+
 
 from dsr_rag import (
     save_to_gridfs,
@@ -17,7 +25,7 @@ from dsr_rag import (
     build_dsr_rag_graph,
     client
 )
-from langgraph.checkpoint.mongodb.aio import AsyncMongoDBSaver
+
 
 app = FastAPI(title="DSR-RAG API")
 
@@ -36,29 +44,45 @@ text_splitter = RecursiveCharacterTextSplitter(
 )
 
 # Initialize checkpointer and compile agent graph once
-checkpointer = AsyncMongoDBSaver(client)
+saver = AsyncLMDBSaver(env)
+
 workflow = build_dsr_rag_graph()
-agent_app = workflow.compile(checkpointer=checkpointer)
+agent_app = workflow.compile(checkpointer=saver)
+
+import pandas as pd
 
 @app.post("/upload")
-async def upload_pdf(file: UploadFile = File(...)):
-    if not file.filename.endswith('.pdf'):
-        raise HTTPException(status_code=400, detail="Only PDF files are supported")
-    
+async def upload_file(file: UploadFile = File(...)):
+    filename = file.filename.lower()
     content = await file.read()
+    full_text = ""
     
-    # Extract text from PDF
     try:
-        doc = pymupdf.open(stream=content, filetype="pdf")
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text() + "\n"
-        doc.close()
+        if filename.endswith('.pdf'):
+            # Extract text from PDF
+            doc = pymupdf.open(stream=content, filetype="pdf")
+            for page in doc:
+                full_text += page.get_text() + "\n"
+            doc.close()
+            
+        elif filename.endswith('.csv'):
+            # Extract text from CSV
+            df = pd.read_csv(io.BytesIO(content))
+            full_text = df.to_string(index=False)
+            
+        elif filename.endswith('.xlsx') or filename.endswith('.xls'):
+            # Extract text from Excel
+            df = pd.read_excel(io.BytesIO(content))
+            full_text = df.to_string(index=False)
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Use PDF, CSV, or XLSX.")
+            
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to parse PDF: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to parse file: {str(e)}")
         
     if not full_text.strip():
-        raise HTTPException(status_code=400, detail="PDF has no extractable text")
+        raise HTTPException(status_code=400, detail="File has no extractable text")
         
     chunks = text_splitter.split_text(full_text)
     metadata = {"filename": file.filename, "source": "user_upload"}
@@ -66,11 +90,8 @@ async def upload_pdf(file: UploadFile = File(...)):
     # Process chunks into MongoDB Atlas
     for i, chunk in enumerate(chunks):
         embedding = await embeddings.aembed_query(chunk)
-        
-        # Save exact chunk text to GridFS (pointer target)
         gridfs_file_id_str = await save_to_gridfs(chunk, file.filename, metadata)
         
-        # Save vector + reference _id
         vector_doc = {
             "embedding": embedding,
             "gridfs_file_id": ObjectId(gridfs_file_id_str),
@@ -79,14 +100,132 @@ async def upload_pdf(file: UploadFile = File(...)):
         }
         await vector_collection.insert_one(vector_doc)
         
-    return {"message": "Document processed and stored successfully", "chunks": len(chunks)}
+    return {"message": f"Document '{file.filename}' processed successfully", "chunks": len(chunks)}
+
+
+@app.get("/sessions")
+async def list_sessions():
+    """Returns unique thread IDs from LMDB checkpointer"""
+    try:
+        sessions = {}
+        async for checkpoint in agent_app.checkpointer.alist(None):
+            thread_id = checkpoint.config["configurable"].get("thread_id")
+            if not thread_id:
+                continue
+                
+            metadata = checkpoint.metadata or {}
+            # Check multiple common timestamp fields
+            timestamp = metadata.get("at") or metadata.get("ts") or metadata.get("created_at") or metadata.get("at")
+            
+            if thread_id not in sessions:
+                # Use thread_id as a fallback if no preview available
+                preview = metadata.get("source", "conversation")
+                sessions[thread_id] = {
+                    "thread_id": thread_id,
+                    "updated_at": timestamp,
+                    "preview": preview
+                }
+        
+        result = list(sessions.values())
+        # Filter out sessions with no timestamp if possible, or just sort them last
+        result.sort(key=lambda x: str(x["updated_at"]) if x["updated_at"] else "", reverse=True)
+        return {"sessions": result}
+    except Exception as e:
+        print(f"[!] Error listing sessions: {e}")
+        return {"sessions": []}
+
+
+@app.get("/sessions/{thread_id}/history")
+async def get_session_history(thread_id: str):
+    """Returns the message history for a specific thread"""
+    try:
+        config = {"configurable": {"thread_id": thread_id}}
+        state = await agent_app.aget_state(config)
+        
+        if not state or not state.values or "messages" not in state.values:
+            return {"messages": []}
+            
+        messages = state.values["messages"]
+        serialized_messages = []
+        
+        for msg in messages:
+            if isinstance(msg, HumanMessage):
+                role = "user"
+            elif isinstance(msg, AIMessage):
+                role = "assistant"
+            elif isinstance(msg, SystemMessage):
+                role = "system"
+            else:
+                role = "assistant" # Default
+                
+            serialized_messages.append({
+                "role": role,
+                "content": msg.content,
+                "sources": msg.additional_kwargs.get("sources", [])
+            })
+            
+        return {"messages": serialized_messages}
+    except Exception as e:
+        print(f"[!] Error fetching history for {thread_id}: {e}")
+        return {"messages": []}
+
+
+@app.delete("/sessions/{thread_id}")
+async def delete_session(thread_id: str):
+    """Deletes all checkpoints and writes for a specific thread_id"""
+    try:
+        saver = agent_app.checkpointer._saver
+        env = saver.env
+        prefix = f"{thread_id}\x00".encode()
+        
+        with saver.lock:
+            with env.begin(write=True) as txn:
+                # 1. Delete checkpoints
+                cursor = txn.cursor(db=saver._db)
+                if cursor.set_range(prefix):
+                    for k, _ in cursor:
+                        if not k.startswith(prefix):
+                            break
+                        txn.delete(k, db=saver._db)
+                
+                # 2. Delete writes
+                w_cursor = txn.cursor(db=saver._writes_db)
+                if w_cursor.set_range(prefix):
+                    for k, _ in w_cursor:
+                        if not k.startswith(prefix):
+                            break
+                        txn.delete(k, db=saver._writes_db)
+                        
+        return {"message": f"Session {thread_id} deleted"}
+    except Exception as e:
+        print(f"[!] Error deleting thread {thread_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/sessions/clear")
+async def clear_sessions():
+    """Clears all conversation checkpoints from LMDB safely"""
+    try:
+        saver = agent_app.checkpointer._saver
+        env = saver.env
+        
+        # Use the internal lock to prevent race conditions during drop
+        with saver.lock:
+            with env.begin(write=True) as txn:
+                # drop(db, delete=False) empties the DB but keeps the handle valid
+                txn.drop(saver._db, delete=False)
+                txn.drop(saver._writes_db, delete=False)
+                
+        return {"message": "All session history cleared successfully"}
+    except Exception as e:
+        print(f"[!] Critical Error clearing LMDB: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to clear sessions: {str(e)}")
 
 
 @app.get("/documents")
 async def list_documents():
     """Returns the list of unique ingested documents (files)"""
     try:
-        # Get distinct filenames
         filenames = await vector_collection.distinct("filename")
         return {"documents": filenames}
     except Exception as e:

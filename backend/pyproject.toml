@@ -16,12 +16,15 @@ langchain-google-genai = "^1.0.2"
 langchain = "*"
 langchain-core = "*"
 langgraph = "*"
-langgraph-checkpoint-mongodb = "0.1.1"
+lmdb = "^1.4.1"
+langgraph-checkpoint-lmdb = "^0.3.1"
 motor = "^3.4.0"
 pydantic = "^2.6.4"
 langchain-text-splitters = "*"
 "pymongo" = {extras = ["srv"], version = "^4.6.0"}
 numexpr = "^2.14.1"
+pandas = "^2.2.1"
+openpyxl = "^3.1.2"
 
 [build-system]
 requires = ["poetry-core"]
