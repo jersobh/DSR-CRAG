@@ -6,6 +6,7 @@ import motor.motor_asyncio
 import logging
 import warnings
 import asyncio
+import json
 
 logging.getLogger("langchain_google_genai._function_utils").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning, module="pydantic")
@@ -202,108 +203,70 @@ async def retrieve_documents(state: GraphState, config: RunnableConfig) -> Dict:
     }
 
 class Grade(BaseModel):
-    binary_score: str = Field(description="Is the document relevant to the question? Answer 'yes' or 'no'")
-
-class RouteQuery(BaseModel):
-    datasource: str = Field(
-        description="The datasource to use for the query. Answer 'vectorstore' if the query needs context from documents, or 'generate' for general conversation or simple tasks.",
-        enum=["vectorstore", "generate"]
-    )
-
-async def route_query(state: GraphState, config: RunnableConfig) -> str:
-    """
-    Routely node: Checks if document retrieval is actually needed.
-    """
-    emit_log(config, "--- NODE: ROUTE QUERY (DECISION) ---")
-    query = state["query"]
-    messages = state.get("messages", [])
-    
-    # Format a brief history snippet for the router to understand context (e.g., who the user is)
-    history_snippet = "\n".join([f"{m.type}: {m.content}" for m in messages[-5:]])
-    
-    system = """You are an expert at routing user queries for a stateful RAG application.
-    Your task is to determine if the user's query requires retrieving information from an external document store (vectorstore) or if it can be answered directly using the conversation history and general knowledge (generate).
-
-    CONTEXT (Last 5 messages):
-    {history}
-
-    DIRECTIONS:
-    - Choose 'generate' for greetings, personal introductions, follow-up questions that can be answered using the provided CONTEXT, or general conversational chit-chat.
-    - Choose 'vectorstore' if the query requires specific factual information, professional knowledge, or details that are not present in the current CONTEXT and likely reside in the document collection.
-
-    Answer ONLY with 'vectorstore' or 'generate'."""
-    
-    prompt = PromptTemplate(
-        template="{system}\n\nUSER QUERY: {question}\n\nDecision:",
-        input_variables=["system", "history", "question"],
-    )
-    
-    # We use the raw LLM for better compatibility with lite models
-    router_chain = prompt | llm
-    
-    try:
-        response = await router_chain.ainvoke({
-            "question": query, 
-            "system": system.format(history=history_snippet),
-            "history": history_snippet
-        })
-        
-        # Manually parse the text response
-        content = response.content.lower().strip()
-        if "vectorstore" in content:
-            emit_log(config, "  -> Datasource decision: vectorstore")
-            return "vectorstore"
-        elif "generate" in content:
-            emit_log(config, "  -> Datasource decision: generate")
-            return "generate"
-        else:
-            emit_log(config, f"  [!] Router returned ambiguous response: '{content}'. Defaulting to vectorstore.")
-            return "vectorstore"
-    except Exception as e:
-        emit_log(config, f"  [!] Routing error: {str(e)}. Defaulting to vectorstore.")
-        return "vectorstore"
+    binary_scores: List[str] = Field(description="A list of 'yes' or 'no' indicating the relevance of each document to the question.")
 
 async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Reflexive grader. Checks if IDs point to useful contexts."""
     emit_log(config, "--- NODE: GRADE DOCUMENTS (EVALUATOR) ---")
     query = state["query"]
-    file_ids = state.get("file_ids", [])
-    filenames = state.get("filenames", [])
+    documents = state.get("documents", [])
     
+    if not documents:
+        emit_log(config, "  -> No documents to grade.")
+        return {"file_ids": [], "filenames": [], "documents": []}
+
     structured_llm_grader = llm.with_structured_output(Grade)
-    system = "You are a semantic relevance judge. Analyze the document to see if it has a positive correlation with the user's question. If it can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'."
+    
+    # Combine all document contents into a single string for batch grading
+    combined_documents_str = ""
+    for i, doc in enumerate(documents):
+        doc_content = doc.get("text", "")
+        filename = doc.get("filename", "Unknown")
+        combined_documents_str += f"== DOCUMENT {i+1} (Source: {filename}) ==\n{doc_content}\n\n"
+
+    system = """You are a semantic relevance judge. You will be provided with a user's question and a list of retrieved documents. For each document, determine if it is relevant to the question. Respond with a JSON object containing a list of 'yes' or 'no' scores, corresponding to each document in the order they were provided. If a document can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'.
+
+Example Output: {\"binary_scores\": [\"yes\", \"no\", \"yes\"]}"""
     
     prompt = PromptTemplate(
-        template="System: {system}\n\nQuestion: {question}\n\nRetrieved Document: {document}\n",
-        input_variables=["system", "question", "document"],
+        template="System: {system}\n\nQuestion: {question}\n\nRetrieved Documents:\n{combined_documents}\n\nGrades (JSON):",
+        input_variables=["system", "question", "combined_documents"],
     )
     grader_chain = prompt | structured_llm_grader
+    
     relevant_ids = []
     relevant_filenames = []
     relevant_docs = []
     
-    # Use documents from state (contains text) instead of loading from GridFS
-    documents = state.get("documents", [])
-    
-    for doc in documents:
-        doc_content = doc.get("text", "")
-        file_id = str(doc.get("gridfs_file_id", ""))
-        filename = doc.get("filename", "Unknown")
+    try:
+        score: Grade = await grader_chain.ainvoke({
+            "question": query, 
+            "combined_documents": combined_documents_str,
+            "system": system
+        })
         
-        try:
-            score: Grade = await grader_chain.ainvoke({"question": query, "document": doc_content, "system": system})
+        if score and score.binary_scores:
+            for i, binary_score in enumerate(score.binary_scores):
+                if i < len(documents):
+                    doc = documents[i]
+                    file_id = str(doc.get("gridfs_file_id", ""))
+                    filename = doc.get("filename", "Unknown")
+                    
+                    if binary_score.lower() == "yes":
+                        emit_log(config, f"  [+] Document {i+1} ({filename}) RELEVANT")
+                        relevant_ids.append(file_id)
+                        relevant_filenames.append(filename)
+                        relevant_docs.append(doc)
+                    else:
+                        emit_log(config, f"  [-] Document {i+1} ({filename}) IRRELEVANT")
+                else:
+                    emit_log(config, f"  [!] Grader returned more scores than documents. Ignoring extra score {i+1}.")
+        else:
+            emit_log(config, "  [!] Grader returned no scores or invalid format. Assuming all irrelevant.")
             
-            if score and score.binary_score.lower() == "yes":
-                emit_log(config, f"  [+] Document ({filename}) RELEVANT")
-                relevant_ids.append(file_id)
-                relevant_filenames.append(filename)
-                relevant_docs.append(doc)
-            else:
-                emit_log(config, f"  [-] Document ({filename}) IRRELEVANT (score: {score})")
-        except Exception as e:
-            emit_log(config, f"  [!] Error grading document {filename}: {str(e)}")
-            continue
-            
+    except Exception as e:
+        emit_log(config, f"  [!] Error grading documents: {str(e)}. Assuming all irrelevant.")
+        
     return {
         "file_ids": relevant_ids, 
         "filenames": relevant_filenames,
@@ -366,7 +329,37 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     context_str = "\n\n=== SOURCE CONTEXT ===\n\n".join(docs_contents)
     messages = state.get("messages", [])
     
-    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.\nYou are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.\n\n### \ud83d\udcda GROUNDING RULES:\n1. Use the provided context to answer. \n2. **CONSOLIDATED ATTRIBUTION**:\n    - **NEVER** cite every single line in a list if they come from the same source.\n    - **CITE ONCE** per paragraph or distinct section.\n    - **PROHIBITED STYLE**: \"Fact 1 [file.pdf]\nFact 2 [file.pdf]\" -> **INCORRECT**.\n    - **REQUIRED STYLE**: \"Here is the list [file.pdf]:\n- Fact 1\n- Fact 2\" OR \"Fact 1 and Fact 2. [file.pdf]\" -> **CORRECT**.\n3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].\n4. Only cite sources provided in the \"SOURCE CONTEXT\" section below.\n5. If no relevant sources exist, do not cite and inform the user you don't have that information.\n\n### \ud83d\udcc8 DATA VISUALIZATION RULES:\n1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.\n2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.\n3. **SIMPLE CHARTS** (Last resort):\n   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.\n     ```mermaid\n     pie title \"Title\"\n         \"A\" : 10\n         \"B\" : 20\n     ```\n   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID[\"Label Text\"]`.\n3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.\n\nProvided Context:\n{context_str}\n\nAnswer with excellence. If the context is insufficient, use tools or inform the user."""
+    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.\
+You are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.\
+
+### 📚 GROUNDING RULES:
+1. Use the provided context to answer. 
+2. **CONSOLIDATED ATTRIBUTION**:
+    - **NEVER** cite every single line in a list if they come from the same source.
+    - **CITE ONCE** per paragraph or distinct section.
+    - **PROHIBITED STYLE**: \"Fact 1 [file.pdf]\nFact 2 [file.pdf]\" -> **INCORRECT**.
+    - **REQUIRED STYLE**: \"Here is the list [file.pdf]:\n- Fact 1\n- Fact 2\" OR \"Fact 1 and Fact 2. [file.pdf]\" -> **CORRECT**.
+3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].
+4. Only cite sources provided in the \"SOURCE CONTEXT\" section below.
+5. If no relevant sources exist, do not cite and inform the user you don't have that information.
+
+### 📊 DATA VISUALIZATION RULES:
+1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
+2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.
+3. **SIMPLE CHARTS** (Last resort):
+   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.
+     ```mermaid
+     pie title \"Title\"
+         \"A\" : 10
+         \"B\" : 20
+     ```
+   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID[\"Label Text\"]`.
+3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.
+
+Provided Context:
+{context_str}
+
+Answer with excellence. If the context is insufficient, use tools or inform the user."""
     
     prompt_messages = [SystemMessage(content=system)] + messages
     human_msg = None
@@ -443,7 +436,12 @@ async def summarize_document(file_id: str) -> str:
 async def query_database_stats() -> str:
     """Returns the total number of documents and chunks currently indexed in the database. Use this when asked 'how many documents do we have?'."""
     try:
-        vector_count = await vector_collection.count_documents({})\n        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]\n        cursor = db["fs.files"].aggregate(pipeline)\n        result = await cursor.to_list(1)\n        pdf_count = result[0]["total"] if result else 0\n        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
+        vector_count = await vector_collection.count_documents({})
+        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]
+        cursor = db["fs.files"].aggregate(pipeline)
+        result = await cursor.to_list(1)
+        pdf_count = result[0]["total"] if result else 0
+        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
     except Exception as e:
         return f"Error accessing database: {e}"
 
@@ -488,7 +486,21 @@ async def query_structured_data(query: str, filename: str) -> str:
         columns = list(df.columns)
         sample = df.head(5).to_string()
         
-        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.\nSample data:\n{sample}\n\nTASK: Write a SHORT Python snippet to answer this question: "{query}"\nThe snippet MUST:\n1. Use the variable 'df'.\n2. Use LOWERCASE column names from the provided list.\n3. Calculate the answer.\n4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.\n5. Do NOT use print(). \n6. Be concise.\n\nCode:"""
+        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.
+Sample data:
+{sample}
+
+TASK: Write a SHORT, EFFICIENT, and CORRECT Python snippet to answer this question: "{query}"
+The snippet MUST:
+1. Use the variable 'df'.
+2. Use LOWERCASE column names from the provided list.
+3. Calculate the answer.
+4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.
+5. Do NOT use print(). 
+6. Avoid complex operations unless absolutely necessary. Prioritize simple aggregations and filters.
+7. Ensure the code is syntactically correct and will execute without errors.
+
+Code:"""
         
         response = await llm.ainvoke(analyze_prompt)
         code = response.content.replace('```python', '').replace('```', '').strip()
