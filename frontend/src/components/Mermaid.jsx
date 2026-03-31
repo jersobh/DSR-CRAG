@@ -16,11 +16,25 @@ mermaid.initialize({
     securityLevel: 'loose',
 });
 
+/**
+ * Mermaid component renders Mermaid diagrams from a given chart definition string.
+ * It includes sanitization logic to handle common issues and ensure proper rendering.
+ *
+ * @param {Object} props - The component props.
+ * @param {string} props.chart - The Mermaid chart definition string.
+ */
 export const Mermaid = ({ chart }) => {
     const ref = useRef(null);
     const [renderId] = useState(() => `mermaid-${Math.random().toString(36).substring(2, 9)}`);
 
-    // Advanced sanitizer for Mermaid v11.13.0
+    /**
+     * Sanitizes the Mermaid chart definition string to prevent rendering issues.
+     * This includes removing markdown code blocks, hallucinatory blocks,
+     * ensuring correct quoting for titles and labels, and removing illegal characters.
+     *
+     * @param {string} text - The raw Mermaid chart definition string.
+     * @returns {string} The sanitized chart definition string.
+     */
     const sanitizeChart = (text) => {
         if (!text) return "";
         let lines = text.trim().split('\n');
