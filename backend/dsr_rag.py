@@ -38,7 +38,7 @@ class GraphState(TypedDict):
         messages (List[BaseMessage]): A list of messages forming the conversation history.
         file_ids (List[str]): A list of GridFS file IDs of retrieved documents.
         filenames (List[str]): A list of filenames corresponding to the retrieved documents.
-        documents (List[Dict[str, Any]]): A list of retrieved document chunks, including their text content.
+        documents (List[Dict[str, Any]]): A list of retrieved document chunks, crucially including their text content for efficient downstream processing.
         query (str): The current user query.
         generation (Optional[str]): The generated answer from the LLM.
         rewrite_count (int): The number of times the query has been rewritten.
@@ -128,6 +128,10 @@ async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> L
     """
     Performs a vector search on the MongoDB 'vectors' collection and
     joins the results with GridFS metadata.
+    
+    Crucially, this function retrieves the document chunk's text content
+    directly within the aggregation pipeline, ensuring efficient "document loading"
+    into the GraphState for subsequent processing without redundant GridFS reads.
 
     Args:
         query_embedding (List[float]): The embedding of the query.
@@ -219,7 +223,8 @@ async def route_query(state: GraphState, config: RunnableConfig) -> str:
     messages = state.get("messages", [])
     
     # Format a brief history snippet for the router to understand context (e.g., who the user is)
-    history_snippet = "\n".join([f"{m.type}: {m.content}" for m in messages[-5:]])
+    history_snippet = "
+".join([f"{m.type}: {m.content}" for m in messages[-5:]])
     
     system = """You are an expert at routing user queries for a stateful RAG application.
     Your task is to determine if the user's query requires retrieving information from an external document store (vectorstore) or if it can be answered directly using the conversation history and general knowledge (generate).
@@ -234,7 +239,11 @@ async def route_query(state: GraphState, config: RunnableConfig) -> str:
     Answer ONLY with 'vectorstore' or 'generate'."""
     
     prompt = PromptTemplate(
-        template="{system}\n\nUSER QUERY: {question}\n\nDecision:",
+        template="{system}
+
+USER QUERY: {question}
+
+Decision:",
         input_variables=["system", "history", "question"],
     )
     
@@ -274,7 +283,12 @@ async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     system = "You are a semantic relevance judge. Analyze the document to see if it has a positive correlation with the user's question. If it can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'."
     
     prompt = PromptTemplate(
-        template="System: {system}\n\nQuestion: {question}\n\nRetrieved Document: {document}\n",
+        template="System: {system}
+
+Question: {question}
+
+Retrieved Document: {document}
+",
         input_variables=["system", "question", "document"],
     )
     grader_chain = prompt | structured_llm_grader
@@ -332,11 +346,16 @@ async def rewrite_query(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
     
     system = "You are a semantic intent translator. The user's question did not get good results in the vector search. Rewrite it focusing on extracting the underlying concept, to get better hits in the database. Keep the query succinct."
-    prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"])
+    prompt = PromptTemplate(template="System: {system}
+
+Original: {question}
+
+New Optimized Query:", input_variables=["system", "question"])
     rewriter_chain = prompt | llm | StrOutputParser()
     new_query = await rewriter_chain.ainvoke({"question": query, "system": system})
     
-    emit_log(config, f"  -> Original: '{query}'\n  -> New: '{new_query}'")
+    emit_log(config, f"  -> Original: '{query}'
+  -> New: '{new_query}'")
     current_count = state.get("rewrite_count", 0)
     return {"query": new_query, "rewrite_count": current_count + 1}
 
@@ -357,16 +376,54 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     for doc in retrieved_docs:
          content = doc.get("text", "")
          name = doc.get("filename", "Unknown Source")
-         docs_contents.append(f"SOURCE: {name}\nCONTENT: {content}")
+         docs_contents.append(f"SOURCE: {name}
+CONTENT: {content}")
          
          if name not in seen_filenames:
              sources_data.append({"filename": name, "content": content})
              seen_filenames.add(name)
              
-    context_str = "\n\n=== SOURCE CONTEXT ===\n\n".join(docs_contents)
+    context_str = "
+
+=== SOURCE CONTEXT ===
+
+".join(docs_contents)
     messages = state.get("messages", [])
     
-    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.\nYou are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.\n\n### \ud83d\udcda GROUNDING RULES:\n1. Use the provided context to answer. \n2. **CONSOLIDATED ATTRIBUTION**:\n    - **NEVER** cite every single line in a list if they come from the same source.\n    - **CITE ONCE** per paragraph or distinct section.\n    - **PROHIBITED STYLE**: \"Fact 1 [file.pdf]\nFact 2 [file.pdf]\" -> **INCORRECT**.\n    - **REQUIRED STYLE**: \"Here is the list [file.pdf]:\n- Fact 1\n- Fact 2\" OR \"Fact 1 and Fact 2. [file.pdf]\" -> **CORRECT**.\n3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].\n4. Only cite sources provided in the \"SOURCE CONTEXT\" section below.\n5. If no relevant sources exist, do not cite and inform the user you don't have that information.\n\n### \ud83d\udcc8 DATA VISUALIZATION RULES:\n1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.\n2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.\n3. **SIMPLE CHARTS** (Last resort):\n   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.\n     ```mermaid\n     pie title \"Title\"\n         \"A\" : 10\n         \"B\" : 20\n     ```\n   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID[\"Label Text\"]`.\n3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.\n\nProvided Context:\n{context_str}\n\nAnswer with excellence. If the context is insufficient, use tools or inform the user."""
+    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.
+You are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.
+
+### 📚 GROUNDING RULES:
+1. Use the provided context to answer. 
+2. **CONSOLIDATED ATTRIBUTION**:
+    - **NEVER** cite every single line in a list if they come from the same source.
+    - **CITE ONCE** per paragraph or distinct section.
+    - **PROHIBITED STYLE**: "Fact 1 [file.pdf]
+Fact 2 [file.pdf]" -> **INCORRECT**.
+    - **REQUIRED STYLE**: "Here is the list [file.pdf]:
+- Fact 1
+- Fact 2" OR "Fact 1 and Fact 2. [file.pdf]" -> **CORRECT**.
+3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].
+4. Only cite sources provided in the "SOURCE CONTEXT" section below.
+5. If no relevant sources exist, do not cite and inform the user you don't have that information.
+
+### 📈 DATA VISUALIZATION RULES:
+1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
+2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.
+3. **SIMPLE CHARTS** (Last resort):
+   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.
+     ```mermaid
+     pie title "Title"
+         "A" : 10
+         "B" : 20
+     ```
+   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID["Label Text"]`.
+3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.
+
+Provided Context:
+{context_str}
+
+Answer with excellence. If the context is insufficient, use tools or inform the user."""
     
     prompt_messages = [SystemMessage(content=system)] + messages
     human_msg = None
@@ -433,7 +490,8 @@ async def summarize_document(file_id: str) -> str:
     """Full summary of a specific document. Requires the exact 'gridfs_file_id' returned in the context."""
     try:
         content = await load_from_gridfs(file_id)
-        prompt = PromptTemplate.from_template("Summarize this document in its entirety:\n{text}")
+        prompt = PromptTemplate.from_template("Summarize this document in its entirety:
+{text}")
         chain = prompt | llm | StrOutputParser()
         return await chain.ainvoke({"text": content[:50000]})
     except Exception as e:
@@ -443,7 +501,12 @@ async def summarize_document(file_id: str) -> str:
 async def query_database_stats() -> str:
     """Returns the total number of documents and chunks currently indexed in the database. Use this when asked 'how many documents do we have?'."""
     try:
-        vector_count = await vector_collection.count_documents({})\n        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]\n        cursor = db["fs.files"].aggregate(pipeline)\n        result = await cursor.to_list(1)\n        pdf_count = result[0]["total"] if result else 0\n        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
+        vector_count = await vector_collection.count_documents({})
+        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]
+        cursor = db["fs.files"].aggregate(pipeline)
+        result = await cursor.to_list(1)
+        pdf_count = result[0]["total"] if result else 0
+        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
     except Exception as e:
         return f"Error accessing database: {e}"
 
@@ -488,7 +551,20 @@ async def query_structured_data(query: str, filename: str) -> str:
         columns = list(df.columns)
         sample = df.head(5).to_string()
         
-        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.\nSample data:\n{sample}\n\nTASK: Write a SHORT Python snippet to answer this question: "{query}"\nThe snippet MUST:\n1. Use the variable 'df'.\n2. Use LOWERCASE column names from the provided list.\n3. Calculate the answer.\n4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.\n5. Do NOT use print(). \n6. Be concise.\n\nCode:"""
+        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.
+Sample data:
+{sample}
+
+TASK: Write a SHORT Python snippet to answer this question: "{query}"
+The snippet MUST:
+1. Use the variable 'df'.
+2. Use LOWERCASE column names from the provided list.
+3. Calculate the answer.
+4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.
+5. Do NOT use print(). 
+6. Be concise.
+
+Code:"""
         
         response = await llm.ainvoke(analyze_prompt)
         code = response.content.replace('```python', '').replace('```', '').strip()
@@ -512,9 +588,15 @@ async def query_structured_data(query: str, filename: str) -> str:
                 result = str(raw_result)
                 
         except Exception as exec_err:
-            result = f"Code execution error: {exec_err}\n\nGenerated Code:\n{code}\nAvailable Columns: {columns}"
+            result = f"Code execution error: {exec_err}
+
+Generated Code:
+{code}
+Available Columns: {columns}"
         
-        return f"Analysis Result for '{query}' on {filename}:\n\n{result}"
+        return f"Analysis Result for '{query}' on {filename}:
+
+{result}"
         
     except Exception as e:
         return f"Error analyzing structured data: {str(e)}"
