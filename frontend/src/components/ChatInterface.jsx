@@ -3,6 +3,14 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { Mermaid } from './Mermaid';
 
+/**
+ * ChatInterface component displays the conversation history, handles user input,
+ * and streams responses from the DSR-CRAG backend. It also manages the display
+ * of retrieved sources in a modal.
+ *
+ * @param {Object} props - The component props.
+ * @param {string} props.threadId - The unique identifier for the current conversation thread.
+ */
 const ChatInterface = ({ threadId }) => {
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
@@ -249,8 +257,7 @@ const ChatInterface = ({ threadId }) => {
                                 </div>
                             </div>
                         </div>
-                    ))
-                )}
+                    ))}
 
                 {isLoading && (
                     <div className="flex justify-start">
@@ -303,7 +310,7 @@ const ChatInterface = ({ threadId }) => {
                 >
                     <div
                         className="bg-white w-full max-w-4xl h-full rounded-[2rem] border border-slate-200 shadow-2xl flex flex-col overflow-hidden animate-in fade-in zoom-in duration-200"
-                        onClick={(e) => e.stopPropagation()}
+                        onClick={(e) => e.stopPropagation())}
                     >
                         <div className="flex items-center justify-between p-6 border-b border-slate-100">
                             <div className="flex items-center gap-4">
