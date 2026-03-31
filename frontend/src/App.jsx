@@ -3,6 +3,13 @@ import FileUpload from './components/FileUpload';
 import ChatInterface from './components/ChatInterface';
 import SessionsList from './components/SessionsList';
 
+/**
+ * The main application component for the DSR-CRAG frontend.
+ *
+ * This component orchestrates the layout and functionality of the application,
+ * including document upload, chat interface, and session management.
+ * It manages the active conversation thread ID and passes it to child components.
+ */
 function App() {
   const [threadId, setThreadId] = useState(
     () => `thread_${Math.random().toString(36).substring(2, 9)}`
