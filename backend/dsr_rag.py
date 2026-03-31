@@ -33,6 +33,15 @@ class GraphState(TypedDict):
     Represents the state of the "Dual-State Reflexive RAG" (DSR-RAG) graph.
     Golden Rule: Long source files NEVER enter here. 
     Retrieved chunks (metadata + text) are allowed for efficient processing.
+
+    Attributes:
+        messages (List[BaseMessage]): A list of messages forming the conversation history.
+        file_ids (List[str]): A list of GridFS file IDs of retrieved documents.
+        filenames (List[str]): A list of filenames corresponding to the retrieved documents.
+        documents (List[Dict[str, Any]]): A list of retrieved document chunks, including their text content.
+        query (str): The current user query.
+        generation (Optional[str]): The generated answer from the LLM.
+        rewrite_count (int): The number of times the query has been rewritten.
     """
     messages: Annotated[List[BaseMessage], operator.add]
     file_ids: List[str] 
@@ -65,6 +74,17 @@ fs = motor.motor_asyncio.AsyncIOMotorGridFSBucket(db)
 # Artifact Offloading to GridFS
 # ==========================================
 async def save_to_gridfs(content: Any, filename: str, metadata: Dict = None) -> str:
+    """
+    Saves content to MongoDB GridFS.
+
+    Args:
+        content (Any): The content to save. Can be bytes or a string.
+        filename (str): The name of the file.
+        metadata (Dict, optional): Additional metadata to store with the file. Defaults to None.
+
+    Returns:
+        str: The string representation of the ObjectId of the saved file.
+    """
     if isinstance(content, str):
         content = content.encode('utf-8')
     file_id = await fs.upload_from_stream(
@@ -75,11 +95,29 @@ async def save_to_gridfs(content: Any, filename: str, metadata: Dict = None) -> 
     return str(file_id)
 
 async def load_from_gridfs(file_id: str) -> str:
+    """
+    Loads content from MongoDB GridFS and decodes it as UTF-8.
+
+    Args:
+        file_id (str): The string representation of the ObjectId of the file to load.
+
+    Returns:
+        str: The decoded content of the file.
+    """
     grid_out = await fs.open_download_stream(ObjectId(file_id))
     content = await grid_out.read()
     return content.decode('utf-8')
 
 async def load_binary_from_gridfs(file_id: ObjectId) -> bytes:
+    """
+    Loads binary content from MongoDB GridFS.
+
+    Args:
+        file_id (ObjectId): The ObjectId of the file to load.
+
+    Returns:
+        bytes: The binary content of the file.
+    """
     grid_out = await fs.open_download_stream(file_id)
     return await grid_out.read()
 
@@ -87,6 +125,18 @@ async def load_binary_from_gridfs(file_id: ObjectId) -> bytes:
 # Native Vector Search and Lookup (Aggregation Pipeline)
 # ==========================================
 async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> List[Dict]:
+    """
+    Performs a vector search on the MongoDB 'vectors' collection and
+    joins the results with GridFS metadata.
+
+    Args:
+        query_embedding (List[float]): The embedding of the query.
+        limit (int, optional): The maximum number of results to return. Defaults to 3.
+
+    Returns:
+        List[Dict]: A list of dictionaries, each representing a retrieved document chunk
+                    with its text, filename, and other metadata.
+    """
     pipeline = [
         {
             "$vectorSearch": {
@@ -316,37 +366,7 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     context_str = "\n\n=== SOURCE CONTEXT ===\n\n".join(docs_contents)
     messages = state.get("messages", [])
     
-    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.
-You are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.
-
-### 📚 GROUNDING RULES:
-1. Use the provided context to answer. 
-2. **CONSOLIDATED ATTRIBUTION**:
-    - **NEVER** cite every single line in a list if they come from the same source.
-    - **CITE ONCE** per paragraph or distinct section.
-    - **PROHIBITED STYLE**: "Fact 1 [file.pdf]\nFact 2 [file.pdf]" -> **INCORRECT**.
-    - **REQUIRED STYLE**: "Here is the list [file.pdf]:\n- Fact 1\n- Fact 2" OR "Fact 1 and Fact 2. [file.pdf]" -> **CORRECT**.
-3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].
-4. Only cite sources provided in the "SOURCE CONTEXT" section below.
-5. If no relevant sources exist, do not cite and inform the user you don't have that information.
-
-### � DATA VISUALIZATION RULES:
-1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
-2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.
-3. **SIMPLE CHARTS** (Last resort):
-   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.
-     ```mermaid
-     pie title "Title"
-         "A" : 10
-         "B" : 20
-     ```
-   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID["Label Text"]`.
-3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.
-
-Provided Context:
-{context_str}
-
-Answer with excellence. If the context is insufficient, use tools or inform the user."""
+    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.\nYou are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.\n\n### \ud83d\udcda GROUNDING RULES:\n1. Use the provided context to answer. \n2. **CONSOLIDATED ATTRIBUTION**:\n    - **NEVER** cite every single line in a list if they come from the same source.\n    - **CITE ONCE** per paragraph or distinct section.\n    - **PROHIBITED STYLE**: \"Fact 1 [file.pdf]\nFact 2 [file.pdf]\" -> **INCORRECT**.\n    - **REQUIRED STYLE**: \"Here is the list [file.pdf]:\n- Fact 1\n- Fact 2\" OR \"Fact 1 and Fact 2. [file.pdf]\" -> **CORRECT**.\n3. **CITATIONS**: Use square brackets, e.g., [filename.pdf].\n4. Only cite sources provided in the \"SOURCE CONTEXT\" section below.\n5. If no relevant sources exist, do not cite and inform the user you don't have that information.\n\n### \ud83d\udcc8 DATA VISUALIZATION RULES:\n1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.\n2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.\n3. **SIMPLE CHARTS** (Last resort):\n   - **PIE**: Only for simple shares. Use double quotes for title and labels. Values MUST be integers.\n     ```mermaid\n     pie title \"Title\"\n         \"A\" : 10\n         \"B\" : 20\n     ```\n   - **FLOWCHART**: Use `graph TD`. Quote ALL labels: `ID[\"Label Text\"]`.\n3. **CRITICAL**: No curly braces `{{ }}` or extra keywords in charts.\n\nProvided Context:\n{context_str}\n\nAnswer with excellence. If the context is insufficient, use tools or inform the user."""
     
     prompt_messages = [SystemMessage(content=system)] + messages
     human_msg = None
@@ -423,12 +443,7 @@ async def summarize_document(file_id: str) -> str:
 async def query_database_stats() -> str:
     """Returns the total number of documents and chunks currently indexed in the database. Use this when asked 'how many documents do we have?'."""
     try:
-        vector_count = await vector_collection.count_documents({})
-        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]
-        cursor = db["fs.files"].aggregate(pipeline)
-        result = await cursor.to_list(1)
-        pdf_count = result[0]["total"] if result else 0
-        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
+        vector_count = await vector_collection.count_documents({})\n        pipeline = [{"$group": {"_id": "$metadata.filename"}}, {"$count": "total"}]\n        cursor = db["fs.files"].aggregate(pipeline)\n        result = await cursor.to_list(1)\n        pdf_count = result[0]["total"] if result else 0\n        return f"We have {pdf_count} unique PDF files indexed, divided into {vector_count} vector search chunks."
     except Exception as e:
         return f"Error accessing database: {e}"
 
@@ -473,20 +488,7 @@ async def query_structured_data(query: str, filename: str) -> str:
         columns = list(df.columns)
         sample = df.head(5).to_string()
         
-        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.
-Sample data:
-{sample}
-
-TASK: Write a SHORT Python snippet to answer this question: "{query}"
-The snippet MUST:
-1. Use the variable 'df'.
-2. Use LOWERCASE column names from the provided list.
-3. Calculate the answer.
-4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.
-5. Do NOT use print(). 
-6. Be concise.
-
-Code:"""
+        analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.\nSample data:\n{sample}\n\nTASK: Write a SHORT Python snippet to answer this question: "{query}"\nThe snippet MUST:\n1. Use the variable 'df'.\n2. Use LOWERCASE column names from the provided list.\n3. Calculate the answer.\n4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.\n5. Do NOT use print(). \n6. Be concise.\n\nCode:"""
         
         response = await llm.ainvoke(analyze_prompt)
         code = response.content.replace('```python', '').replace('```', '').strip()
@@ -522,6 +524,10 @@ llm_with_tools = llm.bind_tools(tools)
 tool_node = ToolNode(tools)
 
 def check_tools(state: GraphState, config: RunnableConfig) -> str:
+    """
+    Conditional Edge: Checks if the last message from the LLM contains tool calls.
+    If tool calls are present, the graph transitions to the 'tools' node; otherwise, it ends.
+    """
     messages = state.get("messages", [])
     if messages and hasattr(messages[-1], "tool_calls") and messages[-1].tool_calls:
         emit_log(config, "  -> Tool call requested by LLM.")
@@ -532,6 +538,29 @@ def check_tools(state: GraphState, config: RunnableConfig) -> str:
 # Graph Construction and Compilation
 # ==========================================
 def build_dsr_rag_graph():
+    """
+    Constructs and compiles the Dual-State Reflexive RAG (DSR-RAG) LangGraph workflow.
+
+    The graph defines the following nodes and edges:
+    - Nodes:
+        - `retrieve_documents`: Performs vector search to retrieve relevant document chunks.
+        - `grade_documents`: Evaluates the relevance of retrieved documents.
+        - `rewrite_query`: Rewrites the user query if no relevant documents are found.
+        - `generate_answer`: Generates the final answer using retrieved context and tools.
+        - `tools`: Executes any tool calls requested by the LLM.
+
+    - Edges:
+        - `START` -> `route_query` (conditional): Routes the initial query to either `retrieve_documents` or `generate_answer`.
+        - `retrieve_documents` -> `grade_documents`: After retrieving documents, they are graded for relevance.
+        - `grade_documents` -> `check_relevance` (conditional): Based on document relevance, either rewrites the query or generates an answer.
+        - `rewrite_query` -> `retrieve_documents`: If the query is rewritten, new documents are retrieved.
+        - `generate_answer` -> `check_tools` (conditional): After generating an answer, checks for tool calls.
+        - `tools` -> `generate_answer`: After tool execution, the answer generation process is re-entered.
+        - `check_tools` -> `END`: If no tool calls are present, the graph ends.
+
+    Returns:
+        StateGraph: The compiled LangGraph workflow.
+    """
     workflow = StateGraph(GraphState)
 
     workflow.add_node("retrieve_documents", retrieve_documents)
