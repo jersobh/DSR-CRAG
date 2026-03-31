@@ -1,3 +1,8 @@
+"""
+This module provides the FastAPI application for the DSR-RAG backend.
+It handles document ingestion, chat interactions, session management, and document deletion.
+"""
+
 import os
 import io
 import asyncio
@@ -53,6 +58,21 @@ import pandas as pd
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
+    """
+    Ingests a PDF, CSV, or XLSX document, extracts its text,
+    creates embeddings for chunks, and stores them in MongoDB.
+    The original file is stored in GridFS.
+
+    Args:
+        file (UploadFile): The uploaded file.
+
+    Returns:
+        dict: A message indicating successful processing and the number of chunks.
+
+    Raises:
+        HTTPException: If the file type is unsupported, parsing fails,
+                       or embedding fails.
+    """
     filename = file.filename.lower()
     content = await file.read()
     full_text = ""
@@ -297,6 +317,15 @@ class ChatRequest(BaseModel):
 
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
+    """
+    Handles chat interactions by streaming responses from the DSR-RAG agent.
+
+    Args:
+        request (ChatRequest): The chat request containing the query and thread ID.
+
+    Returns:
+        StreamingResponse: A streaming response of chat events.
+    """
     async def event_generator():
         # Setup communication queue between the LangGraph execution task and the SSE stream
         queue = asyncio.Queue()
