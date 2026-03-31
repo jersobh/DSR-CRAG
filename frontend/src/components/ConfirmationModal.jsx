@@ -1,5 +1,21 @@
 import React from 'react';
 
+/**
+ * A reusable confirmation modal component.
+ *
+ * This component displays a modal with a title, message, and customizable
+ * confirm/cancel buttons. It is conditionally rendered based on the `isOpen` prop.
+ *
+ * @param {Object} props - The component props.
+ * @param {boolean} props.isOpen - Controls the visibility of the modal.
+ * @param {function} props.onClose - Callback function to close the modal.
+ * @param {function} props.onConfirm - Callback function to execute when the confirm button is clicked.
+ * @param {string} props.title - The title displayed in the modal.
+ * @param {string} props.message - The main message content of the modal.
+ * @param {string} [props.confirmText="Confirm"] - The text for the confirm button.
+ * @param {string} [props.cancelText="Cancel"] - The text for the cancel button.
+ * @param {string} [props.type="danger"] - The type of modal, influencing styling (e.g., "danger" for red buttons).
+ */
 const ConfirmationModal = ({ isOpen, onClose, onConfirm, title, message, confirmText = "Confirm", cancelText = "Cancel", type = "danger" }) => {
     if (!isOpen) return null;
 
