@@ -205,6 +205,10 @@ async def retrieve_documents(state: GraphState, config: RunnableConfig) -> Dict:
 class Grade(BaseModel):
     binary_scores: List[str] = Field(description="A list of 'yes' or 'no' indicating the relevance of each document to the question.")
 
+GRADE_DOCUMENTS_SYSTEM_PROMPT = """You are a semantic relevance judge. You will be provided with a user's question and a list of retrieved documents. For each document, determine if it is relevant to the question. Respond with a JSON object containing a list of 'yes' or 'no' scores, corresponding to each document in the order they were provided. If a document can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'.
+
+Example Output: {"binary_scores": ["yes", "no", "yes"]}"""
+
 async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Reflexive grader. Checks if IDs point to useful contexts."""
     emit_log(config, "--- NODE: GRADE DOCUMENTS (EVALUATOR) ---")
@@ -224,9 +228,6 @@ async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
         filename = doc.get("filename", "Unknown")
         combined_documents_str += f"== DOCUMENT {i+1} (Source: {filename}) ==\n{doc_content}\n\n"
 
-    system = """You are a semantic relevance judge. You will be provided with a user's question and a list of retrieved documents. For each document, determine if it is relevant to the question. Respond with a JSON object containing a list of 'yes' or 'no' scores, corresponding to each document in the order they were provided. If a document can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'.
-
-Example Output: {\"binary_scores\": [\"yes\", \"no\", \"yes\"]}"""
     
     prompt = PromptTemplate(
         template="System: {system}\n\nQuestion: {question}\n\nRetrieved Documents:\n{combined_documents}\n\nGrades (JSON):",
@@ -242,7 +243,7 @@ Example Output: {\"binary_scores\": [\"yes\", \"no\", \"yes\"]}"""
         score: Grade = await grader_chain.ainvoke({
             "question": query, 
             "combined_documents": combined_documents_str,
-            "system": system
+            "system": GRADE_DOCUMENTS_SYSTEM_PROMPT
         })
         
         if score and score.binary_scores:
@@ -295,7 +296,7 @@ async def rewrite_query(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
     
     system = "You are a semantic intent translator. The user's question did not get good results in the vector search. Rewrite it focusing on extracting the underlying concept, to get better hits in the database. Keep the query succinct."
-    prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"])
+    prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"]))
     rewriter_chain = prompt | llm | StrOutputParser()
     new_query = await rewriter_chain.ainvoke({"question": query, "system": system})
     
