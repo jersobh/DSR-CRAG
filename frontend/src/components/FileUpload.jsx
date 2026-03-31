@@ -1,11 +1,23 @@
 import React, { useState, useEffect, useCallback } from 'react';
 
+/**
+ * FileUpload component allows users to upload PDF, CSV, or XLSX documents
+ * to the DSR-CRAG backend. It also displays a list of currently ingested
+ * documents and provides functionality to delete them.
+ *
+ * This component manages the state for selected files, upload status,
+ * and the list of uploaded documents.
+ */
 const FileUpload = () => {
     const [files, setFiles] = useState([]);
     const [uploadedDocs, setUploadedDocs] = useState([]);
     const [status, setStatus] = useState('idle');
     const [message, setMessage] = useState('');
 
+    /**
+     * Fetches the list of all ingested documents from the backend.
+     * This function is memoized using useCallback to prevent unnecessary re-renders.
+     */
     const fetchDocuments = useCallback(async () => {
         try {
             const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
@@ -19,17 +31,28 @@ const FileUpload = () => {
         }
     }, []);
 
+    // Effect hook to fetch documents on component mount and when fetchDocuments changes.
     useEffect(() => {
         // eslint-disable-next-line react-hooks/set-state-in-effect
         fetchDocuments();
     }, [fetchDocuments]);
 
+    /**
+     * Handles the change event when a user selects files for upload.
+     *
+     * @param {Event} e - The change event from the file input.
+     */
     const handleFileChange = (e) => {
         if (e.target.files && e.target.files.length > 0) {
             setFiles(Array.from(e.target.files));
         }
     };
 
+    /**
+     * Handles the document upload process.
+     * Iterates through selected files, uploads each to the backend,
+     * and updates the upload status and messages.
+     */
     const handleUpload = async () => {
         if (files.length === 0) return;
 
@@ -72,6 +95,11 @@ const FileUpload = () => {
         }, 500);
     };
 
+    /**
+     * Handles the deletion of an ingested document from the backend.
+     *
+     * @param {string} filename - The name of the file to be deleted.
+     */
     const handleDelete = async (filename) => {
         try {
             const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
