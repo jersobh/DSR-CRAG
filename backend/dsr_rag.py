@@ -32,7 +32,7 @@ import io
 class GraphState(TypedDict):
     """
     Represents the state of the "Dual-State Reflexive RAG" (DSR-RAG) graph.
-    Golden Rule: Long source files NEVER enter here. 
+    Golden Rule: Long source files NEVER enter here.
     Retrieved chunks (metadata + text) are allowed for efficient processing.
 
     Attributes:
@@ -45,7 +45,7 @@ class GraphState(TypedDict):
         rewrite_count (int): The number of times the query has been rewritten.
     """
     messages: Annotated[List[BaseMessage], operator.add]
-    file_ids: List[str] 
+    file_ids: List[str]
     filenames: List[str]
     documents: List[Dict[str, Any]] # NEW: List of retrieved chunks with text
     query: str
@@ -188,32 +188,38 @@ async def retrieve_documents(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
     query_embedding = await embeddings.aembed_query(query)
     docs = await retrieve_from_mongo(query_embedding, limit=10)
-    
+
     # Stringify ObjectId for msgpack serialization compatibility
     for doc in docs:
         if "gridfs_file_id" in doc:
             doc["gridfs_file_id"] = str(doc["gridfs_file_id"])
-            
+
     retrieved_file_ids = [doc["gridfs_file_id"] for doc in docs]
     filenames = [doc["filename"] for doc in docs]
     return {
-        "file_ids": retrieved_file_ids, 
+        "file_ids": retrieved_file_ids,
         "filenames": filenames,
         "documents": docs
     }
 
-class Grade(BaseModel):
-    binary_scores: List[str] = Field(description="A list of 'yes' or 'no' indicating the relevance of each document to the question.")
+class GradedDocument(BaseModel):
+    filename: str = Field(description="The filename of the document.")
+    is_relevant: bool = Field(description="True if the document is relevant to the question, False otherwise.")
+
+class BatchGrade(BaseModel):
+    grades: List[GradedDocument] = Field(description="A list of graded documents.")
 
 async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Reflexive grader. Checks if IDs point to useful contexts."""
     emit_log(config, "--- NODE: GRADE DOCUMENTS (EVALUATOR) ---")
     query = state["query"]
-    documents = state.get("documents", [])
-    
-    if not documents:
-        emit_log(config, "  -> No documents to grade.")
-        return {"file_ids": [], "filenames": [], "documents": []}
+    messages = state.get("messages", [])
+
+    # Format a brief history snippet for the router to understand context (e.g., who the user is)
+    history_snippet = "\n".join([f"{m.type}: {m.content}" for m in messages[-5:]])
+
+    system = """You are an expert at routing user queries for a stateful RAG application.
+    Your task is to determine if the user's query requires retrieving information from an external document store (vectorstore) or if it can be answered directly using the conversation history and general knowledge (generate).
 
     structured_llm_grader = llm.with_structured_output(Grade)
     
@@ -226,49 +232,115 @@ async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
 
     system = """You are a semantic relevance judge. You will be provided with a user's question and a list of retrieved documents. For each document, determine if it is relevant to the question. Respond with a JSON object containing a list of 'yes' or 'no' scores, corresponding to each document in the order they were provided. If a document can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'.
 
-Example Output: {\"binary_scores\": [\"yes\", \"no\", \"yes\"]}"""
-    
+    Answer ONLY with 'vectorstore' or 'generate'."""
+
     prompt = PromptTemplate(
         template="System: {system}\n\nQuestion: {question}\n\nRetrieved Documents:\n{combined_documents}\n\nGrades (JSON):",
         input_variables=["system", "question", "combined_documents"],
     )
-    grader_chain = prompt | structured_llm_grader
-    
-    relevant_ids = []
-    relevant_filenames = []
-    relevant_docs = []
-    
+
+    # We use the raw LLM for better compatibility with lite models
+    router_chain = prompt | llm
+
     try:
-        score: Grade = await grader_chain.ainvoke({
-            "question": query, 
-            "combined_documents": combined_documents_str,
-            "system": system
+        response = await router_chain.ainvoke({
+            "question": query,
+            "system": system.format(history=history_snippet),
+            "history": history_snippet
         })
-        
-        if score and score.binary_scores:
-            for i, binary_score in enumerate(score.binary_scores):
-                if i < len(documents):
-                    doc = documents[i]
-                    file_id = str(doc.get("gridfs_file_id", ""))
-                    filename = doc.get("filename", "Unknown")
-                    
-                    if binary_score.lower() == "yes":
-                        emit_log(config, f"  [+] Document {i+1} ({filename}) RELEVANT")
-                        relevant_ids.append(file_id)
-                        relevant_filenames.append(filename)
-                        relevant_docs.append(doc)
-                    else:
-                        emit_log(config, f"  [-] Document {i+1} ({filename}) IRRELEVANT")
-                else:
-                    emit_log(config, f"  [!] Grader returned more scores than documents. Ignoring extra score {i+1}.")
+
+        # Manually parse the text response
+        content = response.content.lower().strip()
+        if "vectorstore" in content:
+            emit_log(config, "  -> Datasource decision: vectorstore")
+            return "vectorstore"
+        elif "generate" in content:
+            emit_log(config, "  -> Datasource decision: generate")
+            return "generate"
         else:
             emit_log(config, "  [!] Grader returned no scores or invalid format. Assuming all irrelevant.")
             
     except Exception as e:
-        emit_log(config, f"  [!] Error grading documents: {str(e)}. Assuming all irrelevant.")
-        
+        emit_log(config, f"  [!] Routing error: {str(e)}. Defaulting to vectorstore.")
+        return "vectorstore"
+
+async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
+    """Node: Reflexive grader. Checks if IDs point to useful contexts."""
+    emit_log(config, "--- NODE: GRADE DOCUMENTS (EVALUATOR) ---")
+    query = state["query"]
+    documents = state.get("documents", [])
+
+    if not documents:
+        emit_log(config, "  -> No documents to grade.")
+        return {
+            "file_ids": [],
+            "filenames": [],
+            "documents": []
+        }
+
+    # Prepare documents for batch grading
+    docs_for_grading = []
+    for i, doc in enumerate(documents):
+        docs_for_grading.append(f"DOCUMENT {i+1} (Filename: {doc.get('filename', 'Unknown')}):\n{doc.get('text', '')}\n")
+
+    combined_documents_str = "\n---\n".join(docs_for_grading)
+
+    system = """You are a semantic relevance judge. Your task is to analyze a list of documents and determine which ones are relevant to the user's question.
+    For each document, indicate if it has a positive correlation with the user's question, can help answer it, or contains coherent keywords.
+
+    Return a JSON array of objects, where each object has 'filename' and 'is_relevant' (boolean) fields.
+    Example:
+    [
+      {"filename": "doc1.pdf", "is_relevant": true},
+      {"filename": "doc2.txt", "is_relevant": false}
+    ]
+    """
+
+    prompt = PromptTemplate(
+        template="System: {system}\n\nQuestion: {question}\n\nRetrieved Documents:\n{documents_to_grade}\n\nGrading Result (JSON array):",
+        input_variables=["system", "question", "documents_to_grade"],
+    )
+
+    batch_grader_chain = prompt | llm.with_structured_output(BatchGrade)
+
+    relevant_ids = []
+    relevant_filenames = []
+    relevant_docs = []
+
+    try:
+        batch_score: BatchGrade = await batch_grader_chain.ainvoke({
+            "question": query,
+            "documents_to_grade": combined_documents_str,
+            "system": system
+        })
+
+        # Map graded results back to original documents
+        graded_results_map = {grade.filename: grade.is_relevant for grade in batch_score.grades}
+
+        for doc in documents:
+            filename = doc.get("filename", "Unknown")
+            file_id = str(doc.get("gridfs_file_id", ""))
+            is_relevant = graded_results_map.get(filename, False) # Default to False if not graded
+
+            if is_relevant:
+                emit_log(config, f"  [+] Document ({filename}) RELEVANT")
+                relevant_ids.append(file_id)
+                relevant_filenames.append(filename)
+                relevant_docs.append(doc)
+            else:
+                emit_log(config, f"  [-] Document ({filename}) IRRELEVANT")
+
+    except Exception as e:
+        emit_log(config, f"  [!] Error batch grading documents: {str(e)}. All documents considered irrelevant.")
+        # Fallback: if grading fails, consider all documents irrelevant to be safe
+        return {
+            "file_ids": [],
+            "filenames": [],
+            "documents": []
+        }
+
     return {
-        "file_ids": relevant_ids, 
+        "file_ids": relevant_ids,
         "filenames": relevant_filenames,
         "documents": relevant_docs
     }
@@ -278,14 +350,14 @@ def check_relevance(state: GraphState, config: RunnableConfig) -> str:
     emit_log(config, "--- ROUTING: CHECK RELEVANCE ---")
     file_ids = state.get("file_ids", [])
     rewrite_count = state.get("rewrite_count", 0)
-    
+
     if len(file_ids) == 0:
         if rewrite_count >= 3:
             emit_log(config, "  -> Rewrite limit reached. Forcing fallback answer.")
             return "generate_answer"
         emit_log(config, "  -> No useful sources. Redirecting to REWRITE_QUERY.")
         return "rewrite_query"
-    
+
     emit_log(config, "  -> Useful sources detected. Redirecting to GENERATE_ANSWER.")
     return "generate_answer"
 
@@ -293,12 +365,12 @@ async def rewrite_query(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Self-Correction Loop. Rewrites the query."""
     emit_log(config, "--- NODE: REWRITE QUERY ---")
     query = state["query"]
-    
+
     system = "You are a semantic intent translator. The user's question did not get good results in the vector search. Rewrite it focusing on extracting the underlying concept, to get better hits in the database. Keep the query succinct."
     prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"])
     rewriter_chain = prompt | llm | StrOutputParser()
     new_query = await rewriter_chain.ainvoke({"question": query, "system": system})
-    
+
     emit_log(config, f"  -> Original: '{query}'\n  -> New: '{new_query}'")
     current_count = state.get("rewrite_count", 0)
     return {"query": new_query, "rewrite_count": current_count + 1}
@@ -309,11 +381,11 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
     file_ids = state.get("file_ids", [])
     filenames = state.get("filenames", [])
-    
+
     docs_contents = []
     sources_data = []
     seen_filenames = set()
-    
+
     # Use documents from state (contains text) instead of loading from GridFS
     retrieved_docs = state.get("documents", [])
 
@@ -321,19 +393,19 @@ async def generate_answer(state: GraphState, config: RunnableConfig) -> Dict:
          content = doc.get("text", "")
          name = doc.get("filename", "Unknown Source")
          docs_contents.append(f"SOURCE: {name}\nCONTENT: {content}")
-         
+
          if name not in seen_filenames:
              sources_data.append({"filename": name, "content": content})
              seen_filenames.add(name)
-             
+
     context_str = "\n\n=== SOURCE CONTEXT ===\n\n".join(docs_contents)
     messages = state.get("messages", [])
-    
-    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.\
-You are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.\
 
-### 📚 GROUNDING RULES:
-1. Use the provided context to answer. 
+    system = f"""You are an advanced RAG assistant (DSR-CRAG). You have access to tools and retrieved context.
+You are also a data visualization expert. You MUST generate charts (pie, bar, xychart-beta) or diagrams (flowchart) in Mermaid format whenever the answer involves quantitative data, statistics, or processes.
+
+### \ud83d\udcda GROUNDING RULES:
+1. Use the provided context to answer.
 2. **CONSOLIDATED ATTRIBUTION**:
     - **NEVER** cite every single line in a list if they come from the same source.
     - **CITE ONCE** per paragraph or distinct section.
@@ -343,7 +415,7 @@ You are also a data visualization expert. You MUST generate charts (pie, bar, xy
 4. Only cite sources provided in the \"SOURCE CONTEXT\" section below.
 5. If no relevant sources exist, do not cite and inform the user you don't have that information.
 
-### 📊 DATA VISUALIZATION RULES:
+### \ud83d\udcc8 DATA VISUALIZATION RULES:
 1. **PREFER MARKDOWN TABLES** for any data involving trends, bar charts, or complex lists.
 2. **QUANTITATIVE DATA**: If the user asks for counts, sums, averages, or analysis from an uploaded CSV/XLSX file, **YOU MUST** use the `query_structured_data` tool instead of relying on vector search chunks. Vector search only gives you fragments, while the tool gives you the whole picture.
 3. **SIMPLE CHARTS** (Last resort):
@@ -360,18 +432,18 @@ Provided Context:
 {context_str}
 
 Answer with excellence. If the context is insufficient, use tools or inform the user."""
-    
+
     prompt_messages = [SystemMessage(content=system)] + messages
     human_msg = None
-    
+
     if messages and hasattr(messages[-1], "type") and messages[-1].type == "tool":
         pass
     else:
         human_msg = HumanMessage(content=query)
         prompt_messages.append(human_msg)
-        
+
     queue = config.get("configurable", {}).get("queue")
-    
+
     if queue:
         # Emit final sources list (enriched with content) before streaming tokens
         try:
@@ -395,19 +467,19 @@ Answer with excellence. If the context is insufficient, use tools or inform the 
                         queue.put_nowait({"type": "log", "message": f"Calling tool {chunk_tc['name']}..."})
                     except:
                         pass
-        
+
         # We must re-invoke non-streaming to correctly capture the tool call object for langgraph state
         response = await llm_with_tools.ainvoke(prompt_messages)
     else:
         response = await llm_with_tools.ainvoke(prompt_messages)
-    
+
     if human_msg:
         delta_messages = [human_msg, response]
     else:
         delta_messages = [response]
-        
+
     generation_result = response.content if not response.tool_calls else None
-    
+
     return {"messages": delta_messages, "generation": generation_result}
 
 # ==========================================
@@ -447,7 +519,7 @@ async def query_database_stats() -> str:
 
 @tool
 async def query_structured_data(query: str, filename: str) -> str:
-    """Useful for quantitative analysis on CSV/XLSX files (counting, aggregate, filter). 
+    """Useful for quantitative analysis on CSV/XLSX files (counting, aggregate, filter).
     Pass the natural language query and the filename (e.g., 'How many companies from Europe?', 'data.csv')."""
     try:
         # 1. Find the structured file in GridFS
@@ -459,10 +531,10 @@ async def query_structured_data(query: str, filename: str) -> str:
              files = await cursor.to_list(length=1)
              if not files:
                  return f"File '{filename}' not found or not indexed as structured data."
-        
+
         file_id = files[0]["_id"]
         content = await load_binary_from_gridfs(file_id)
-        
+
         # 2. Load into Pandas
         try:
             if filename.endswith('.csv'):
@@ -478,39 +550,38 @@ async def query_structured_data(query: str, filename: str) -> str:
                  df = pd.read_csv(io.StringIO(content.decode('utf-8-sig', errors='ignore')), sep=None, engine='python')
              else:
                  raise parse_err
-        
+
         # CLEANUP: Strip whitespace and LOWERCASE column names to avoid KeyErrors
         df.columns = [c.strip().lower() for c in df.columns]
-            
+
         # 3. Use LLM to generate analysis code
         columns = list(df.columns)
         sample = df.head(5).to_string()
-        
+
         analyze_prompt = f"""You are a Python data analyst. Given a DataFrame 'df' with columns {columns}.
 Sample data:
 {sample}
 
-TASK: Write a SHORT, EFFICIENT, and CORRECT Python snippet to answer this question: "{query}"
+TASK: Write a SHORT Python snippet to answer this question: "{query}"
 The snippet MUST:
 1. Use the variable 'df'.
 2. Use LOWERCASE column names from the provided list.
 3. Calculate the answer.
 4. Assign the FINAL scalar result (string, number, or markdown table) to a variable named 'result'.
-5. Do NOT use print(). 
-6. Avoid complex operations unless absolutely necessary. Prioritize simple aggregations and filters.
-7. Ensure the code is syntactically correct and will execute without errors.
+5. Do NOT use print().
+6. Be concise.
 
 Code:"""
-        
+
         response = await llm.ainvoke(analyze_prompt)
         code = response.content.replace('```python', '').replace('```', '').strip()
-        
+
         # 4. Execute (sandbox-lite)
         local_vars = {"df": df, "pd": pd}
         try:
             exec(code, {}, local_vars)
             raw_result = local_vars.get("result", "No result returned from code execution.")
-            
+
             # FORMATTING: If result is a DataFrame or Series, convert to Markdown table
             try:
                 if isinstance(raw_result, pd.DataFrame):
@@ -522,12 +593,12 @@ Code:"""
             except ImportError:
                 # Fallback if 'tabulate' is not installed yet
                 result = str(raw_result)
-                
+
         except Exception as exec_err:
             result = f"Code execution error: {exec_err}\n\nGenerated Code:\n{code}\nAvailable Columns: {columns}"
-        
+
         return f"Analysis Result for '{query}' on {filename}:\n\n{result}"
-        
+
     except Exception as e:
         return f"Error analyzing structured data: {str(e)}"
 
@@ -599,8 +670,8 @@ def build_dsr_rag_graph():
         {"generate_answer": "generate_answer", "rewrite_query": "rewrite_query"}
     )
 
-    workflow.add_edge("rewrite_query", "retrieve_documents") 
+    workflow.add_edge("rewrite_query", "retrieve_documents")
     workflow.add_conditional_edges("generate_answer", check_tools, {"tools": "tools", END: END})
     workflow.add_edge("tools", "generate_answer")
-    
+
     return workflow
