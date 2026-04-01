@@ -1,0 +1,32 @@
+[tool.poetry]
+name = "dsr-rag-backend"
+version = "0.1.0"
+description = "DSR RAG Backend"
+authors = ["Your Name <you@example.com>"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.110.1"
+uvicorn = "^0.29.0"
+python-multipart = "^0.0.9"
+pymupdf = "^1.24.1"
+langchain-google-genai = "^1.0.2"
+langchain = "*"
+langchain-core = "*"
+langgraph = "*"
+lmdb = "^1.4.1"
+langgraph-checkpoint-lmdb = "^0.3.1"
+motor = "^3.4.0"
+pydantic = "^2.6.4"
+langchain-text-splitters = "*"
+"pymongo" = {extras = ["srv"], version = "^4.6.0"}
+numexpr = "^2.14.1"
+pandas = "^2.2.1"
+openpyxl = "^3.1.2"
+tabulate = "^0.9.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
