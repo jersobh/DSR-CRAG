@@ -125,7 +125,7 @@ async def load_binary_from_gridfs(file_id: ObjectId) -> bytes:
 # ==========================================
 # Native Vector Search and Lookup (Aggregation Pipeline)
 # ==========================================
-async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> List[Dict]:
+async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3, num_candidates: Optional[int] = None) -> List[Dict]:
     """
     Performs a vector search on the MongoDB 'vectors' collection and
     joins the results with GridFS metadata.
@@ -133,18 +133,22 @@ async def retrieve_from_mongo(query_embedding: List[float], limit: int = 3) -> L
     Args:
         query_embedding (List[float]): The embedding of the query.
         limit (int, optional): The maximum number of results to return. Defaults to 3.
+        num_candidates (int, optional): The number of nearest neighbors to search. Defaults to limit * 10.
 
     Returns:
         List[Dict]: A list of dictionaries, each representing a retrieved document chunk
                     with its text, filename, and other metadata.
     """
+    if num_candidates is None:
+        num_candidates = limit * 10
+
     pipeline = [
         {
             "$vectorSearch": {
                 "index": "vector_index",
                 "path": "embedding",
                 "queryVector": query_embedding,
-                "numCandidates": limit * 10,
+                "numCandidates": num_candidates,
                 "limit": limit
             }
         },
@@ -367,7 +371,7 @@ async def rewrite_query(state: GraphState, config: RunnableConfig) -> Dict:
     query = state["query"]
 
     system = "You are a semantic intent translator. The user's question did not get good results in the vector search. Rewrite it focusing on extracting the underlying concept, to get better hits in the database. Keep the query succinct."
-    prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"])
+    prompt = PromptTemplate(template="System: {system}\n\nOriginal: {question}\n\nNew Optimized Query:", input_variables=["system", "question"]))
     rewriter_chain = prompt | llm | StrOutputParser()
     new_query = await rewriter_chain.ainvoke({"question": query, "system": system})
 
