@@ -213,6 +213,10 @@ class GradedDocument(BaseModel):
 class BatchGrade(BaseModel):
     grades: List[GradedDocument] = Field(description="A list of graded documents.")
 
+GRADE_DOCUMENTS_SYSTEM_PROMPT = """You are a semantic relevance judge. You will be provided with a user's question and a list of retrieved documents. For each document, determine if it is relevant to the question. Respond with a JSON object containing a list of 'yes' or 'no' scores, corresponding to each document in the order they were provided. If a document can help answer or has coherent keywords, return 'yes'. Otherwise, 'no'.
+
+Example Output: {"binary_scores": ["yes", "no", "yes"]}"""
+
 async def grade_documents(state: GraphState, config: RunnableConfig) -> Dict:
     """Node: Reflexive grader. Checks if IDs point to useful contexts."""
     emit_log(config, "--- NODE: GRADE DOCUMENTS (EVALUATOR) ---")
